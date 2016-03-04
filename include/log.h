@@ -16,11 +16,11 @@
 
 typedef enum logLevel
 {
-	enLvlNone = 0,
-	enLvlErr,
-	enLvlWarn,
-	enLvlInfo,
-	enLvlDebug
+	None = 0,
+	Err,
+	Warn,
+	Info,
+	Debug
 }EN_LOG_LEVEL;
 
 typedef struct stLogConf
@@ -33,14 +33,14 @@ typedef struct stLogConf
 
 #ifndef OPEN_SYSLOG
 #define LOGFUNC(levels, isperror, fmt...) { \
-	if(levels <= enLvlDebug || levels > enLvlNone) { \
-		if(levels == enLvlErr){ \
+	if(levels <= Debug || levels > None) { \
+		if(levels == Err){ \
 			printf("ERR: ");	\
-		}else if(levels == enLvlWarn){	\
+		}else if(levels == Warn){	\
 			printf("WARN: ");	\
-		}else if (levels == enLvlInfo){ \
+		}else if (levels == Info){ \
 			printf("INFO: "); \
-		}else if (levels == enLvlDebug){ \
+		}else if (levels == Debug){ \
 			printf("DBG: "); \
 		} \
 		printf("[File: %-10s, Line: %05d, Func: %-10s]", __FILE__, \
@@ -54,16 +54,16 @@ typedef struct stLogConf
 extern ST_LOG_CONF gstLogConf;
 #define LOGFUNC(levels, isperror, fmt, args...) { \
 	if(levels <= gstLogConf.s32SetLevel) { \
-		if(levels == enLvlErr){ \
+		if(levels == Err){ \
 			gstLogConf.s32LogLevel = LOG_ERR; \
-		}else if(levels == enLvlWarn){	\
+		}else if(levels == Warn){	\
 			gstLogConf.s32LogLevel = LOG_WARNING; \
-		}else if (levels == enLvlInfo){ \
+		}else if (levels == Info){ \
 			gstLogConf.s32LogLevel = LOG_INFO; \
-		}else if (levels == enLvlDebug){ \
+		}else if (levels == Debug){ \
 			gstLogConf.s32LogLevel = LOG_DEBUG; \
 		} \
-		if(gstLogConf.level > enLvlNone && gstLogConf.level <= enLvlDebug){ \
+		if(gstLogConf.level > None && gstLogConf.level <= Debug){ \
 			if(isperror == True){ \
 				syslog(gstLogConf.s32LogLevel, "PERROR[%s] : " fmt, strerror(errno), ## args); \
 			}else{\

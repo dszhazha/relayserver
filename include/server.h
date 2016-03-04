@@ -23,6 +23,14 @@
 
 #define UPDATE_INTERVAL 	0
 
+#define DATA_BUFFER_SIZE 2048
+
+/** Initial size of the sendmsg() scatter/gather array. */
+#define IOV_LIST_INITIAL 400
+
+/** Initial number of sendmsg() argument structures to allocate. */
+#define MSG_LIST_INITIAL 10
+
 /**
  * Possible states of a connection.
  */
@@ -61,22 +69,23 @@ struct connectInformation
 {
 	sint32	s32Sockfd;
 	struct event event;
-
+	sint16  ev_flags;
+	
 	rel_time_t	last_cmd_time;
 
 	EN_CONN_STAT	enConnStat;
 
 	/*read buffer struct*/
-	sint8   *s8Rbuf;   /** buffer to read commands into */
-    sint8   *s8Rcurr;  /** but if we parsed some already, this is where we stopped */
-    sint32    s32Rsize;   /** total allocated size of rbuf */
-    sint32    s32Rbytes;  /** how much data, starting from rcur, do we have unparsed */
+	sint8   *rbuf;   /** buffer to read commands into */
+    sint8   *rcurr;  /** but if we parsed some already, this is where we stopped */
+    sint32    rsize;   /** total allocated size of rbuf */
+    sint32    rbytes;  /** how much data, starting from rcur, do we have unparsed */
 
 	/*write buffer struct*/
-    sint8   *s8Wbuf;
-    sint8   *s8Wcurr;
-    sint32    s32Wsize;
-    sint32    s32Wbytes;
+    sint8   *wbuf;
+    sint8   *wcurr;
+    sint32    wsize;
+    sint32    wbytes;
 
 	/* data for the mwrite state */
     struct iovec *iov;
@@ -89,6 +98,9 @@ struct connectInformation
     int    msgcurr;   /* element in msglist[] being transmitted now */
     int    msgbytes;  /* number of bytes in current msg */
 
+	struct sockaddr_in request_addr;
+    socklen_t request_addr_size;
+
 	ST_CONN_INFO		*pstConnNext;
 	ST_LIBEVENT_THREAD	*pstThread;
 };
@@ -96,8 +108,11 @@ struct connectInformation
 typedef struct replaySettings
 {
 	sint32 		s32MaxConns;	/*Maximum connect number*/
-	bool		bVerbose;		/*display detail debug information*/
+	bool		verbose;		/*display detail debug information*/
 	sint32		s32ThreadNum; 	/* number of worker (without dispatcher) libevent threads to run */
 	sint32		s32Backlog;	
 	sint32 		s32ReqsPerEvent;     /* Maximum number of io to process on each io-event. */
 }ST_REPLAY_SETTINGS;
+
+extern ST_REPLAY_SETTINGS	gstSettings;
+

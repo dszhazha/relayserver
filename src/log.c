@@ -38,21 +38,21 @@ sint32 LOG_Init(void)
 
 	switch(gstLogConf.s32Level)
 	{
-		case enLvlErr:
+		case Err:
 			setlogmask (LOG_UPTO (LOG_ERR));
-			gstLogConf.s32SetLevel = enLvlErr;
+			gstLogConf.s32SetLevel = Err;
 			break;
-		case enLvlWarn:
+		case Warn:
 			setlogmask (LOG_UPTO (LOG_WARNING));
-			gstLogConf.s32SetLevel = enLvlWarn;
+			gstLogConf.s32SetLevel = Warn;
 			break;		
-		case enLvlInfo:
+		case Info:
 			setlogmask (LOG_UPTO (LOG_INFO));
-			gstLogConf.s32SetLevel = enLvlInfo;
+			gstLogConf.s32SetLevel = Info;
 			break;		
-		case enLvlDebug:
+		case Debug:
 			setlogmask (LOG_UPTO (LOG_DEBUG));
-			gstLogConf.s32SetLevel = enLvlDebug;
+			gstLogConf.s32SetLevel = Debug;
 			break;	
 		default:
 			return SUCCESS;
@@ -82,21 +82,21 @@ sint32 LOG_UpdataConf(void)
 
 	switch(gstLogConf.s32Level)
 	{
-		case enLvlErr:
+		case Err:
 			setlogmask (LOG_UPTO (LOG_ERR));
-			gstLogConf.s32SetLevel = enLvlErr;
+			gstLogConf.s32SetLevel = Err;
 			break;
-		case enLvlWarn:
+		case Warn:
 			setlogmask (LOG_UPTO (LOG_WARNING));
-			gstLogConf.s32SetLevel = enLvlWarn;
+			gstLogConf.s32SetLevel = Warn;
 			break;		
-		case enLvlInfo:
+		case Info:
 			setlogmask (LOG_UPTO (LOG_INFO));
-			gstLogConf.s32SetLevel = enLvlInfo;
+			gstLogConf.s32SetLevel = Info;
 			break;		
-		case enLvlDebug:
+		case Debug:
 			setlogmask (LOG_UPTO (LOG_DEBUG));
-			gstLogConf.s32SetLevel = enLvlDebug;
+			gstLogConf.s32SetLevel = Debug;
 			break;	
 		default:
 			return SUCCESS;
