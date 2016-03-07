@@ -32,7 +32,7 @@ typedef struct stLogConf
 }ST_LOG_CONF;
 
 #ifndef OPEN_SYSLOG
-#define LOGFUNC(levels, isperror, fmt...) { \
+#define LOG_FUNC(levels, isperror, fmt...) { \
 	if(levels <= Debug || levels > None) { \
 		if(levels == Err){ \
 			printf("ERR: ");	\
@@ -43,7 +43,7 @@ typedef struct stLogConf
 		}else if (levels == Debug){ \
 			printf("DBG: "); \
 		} \
-		printf("[File: %-10s, Line: %05d, Func: %-10s]", __FILE__, \
+		printf("[File: %-10s, Line: %05d, Func: %-20s]\n", __FILE__, \
 				__LINE__, __FUNCTION__); \
 		printf(fmt); \
 		printf("\n"); \
@@ -52,7 +52,7 @@ typedef struct stLogConf
 }
 #else
 extern ST_LOG_CONF gstLogConf;
-#define LOGFUNC(levels, isperror, fmt, args...) { \
+#define LOG_FUNC(levels, isperror, fmt, args...) { \
 	if(levels <= gstLogConf.s32SetLevel) { \
 		if(levels == Err){ \
 			gstLogConf.s32LogLevel = LOG_ERR; \

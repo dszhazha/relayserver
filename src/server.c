@@ -39,65 +39,82 @@
 #include <stddef.h>
 
 /*global value declaration*/
-ST_CONN_INFO 		**ppstConnList;
-static ST_CONN_INFO *listen_conn = NULL;
+ST_RELAY_SETTINGS 	gstSettings;
+ST_RELAY_STATUS		gstStats;
 
-ST_REPLAY_SETTINGS	gstSettings;
-static struct event_base *main_base;
-time_t process_started;     /* when the process was started */
+
+ST_CONN_INFO **ppstConnList;
+static ST_CONN_INFO *gpstListenConnList = NULL;
+static struct event_base *gebMainBase;
+
+static sint32 gs32MaxFds;
+
+/*
+ * We keep the current time of day in a global variable that's updated by a
+ * timer event. This saves us a bunch of time() system calls (we really only
+ * need to get the time once a second, whereas there can be tens of thousands
+ * of requests a second) and allows us to use server-start-relative timestamps
+ * rather than absolute UNIX timestamps, a space savings on systems where
+ * sizeof(time_t) > sizeof(unsigned int).
+ */
+volatile rel_time_t grtCurrentTime;
+static struct event gevClockevent;
+rel_time_t grtProcessStarted;     /* when the process was started */
+
 
 /* This reduces the latency without adding lots of extra wiring to be able to
  * notify the listener thread of when to listen again.
  * Also, the clock timer could be broken out into its own thread and we
  * can block the listener via a condition.
  */
-static volatile bool allow_new_conns = true;
-
-static int 			gs32MaxFds;
-
-void event_handler(const int fd, const short which, void *arg); 
-static void drive_machine(ST_CONN_INFO *c);
-
-extern void relaysrv_thread_init(int nthreads, struct event_base *main_base); 
+static volatile bool gbAllowNewConns = true;
 
 
+void EVENT_ConnHandler(const sint32 fd, const sint16 which, void *arg); 
 
-/**
- * Do basic sanity check of the runtime environment
- * @return true if no errors found, false if we can't use this env
- */
-static bool sanitycheck(void) 
+extern void THERAD_RelaysrvInit(sint32 nthreads, struct event_base *main_base); 
+extern void THREAD_DispatchConnNew(sint32 sfd, EN_CONN_STAT init_state, sint32 event_flags,
+                       sint32 read_buffer_size) ;
+extern void STATS_LOCK(void);
+extern void STATS_UNLOCK(void); 
+
+static void SETTINGS_Init(void)
 {
-    /* One of our biggest problems is old and bogus libevents */
-    const char *ever = event_get_version();
-    if (ever != NULL) 
-	{
-        if (strncmp(ever, "1.", 2) == 0) 
-		{
-            /* Require at least 1.3 (that's still a couple of years old) */
-            if (('0' <= ever[2] && ever[2] < '3') && !isdigit(ever[3])) 
-			{
-                LOGFUNC(Err, False, "You are using libevent %s.\nPlease upgrade to"
-                        " a more recent version (1.3 or newer)\n", event_get_version());
-                return false;
-            }
-        }
-    }
-
-	LOGFUNC(Info, False, "current libevent version is %s \n", event_get_version());
-    return true;
-}
-
-static void settings_init(void)
-{
-	gstSettings.verbose = False;
+	gstSettings.bVerbose = False;
 	gstSettings.s32Backlog = 1024;
 	gstSettings.s32MaxConns = 1024;
 	gstSettings.s32ReqsPerEvent = 4;
 	gstSettings.s32ThreadNum = 4;
 
-	process_started = time(0) - UPDATE_INTERVAL - 2;
+	grtProcessStarted = time(0) - UPDATE_INTERVAL - 2;
 }
+
+static void STATS_Init(void)
+{
+	gstStats.u32CurrConns = gstStats.u32TotalConns = 0;
+	gstStats.u32ReservedFds = 0;
+}
+
+static sint32 CONN_NewSocket(struct addrinfo *ai) 
+{
+    sint32 s32Fd;
+    sint32 s32Flags;
+
+    if ((s32Fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1) 
+	{
+        return FAIL;
+    }
+
+    if ((s32Flags = fcntl(s32Fd, F_GETFL, 0)) < 0 ||
+        fcntl(s32Fd, F_SETFL, s32Flags | O_NONBLOCK) < 0)
+    {
+		LOG_FUNC(Err, False, "setting O_NONBLOCK");
+        close(s32Fd);
+        return FAIL;
+    }
+    return s32Fd;
+}
+
 
 /*
  * Initializes the connections array. We don't actually allocate connection
@@ -109,15 +126,15 @@ static void settings_init(void)
  * used for things other than connections, but that's worth it in exchange for
  * being able to directly index the conns array by FD.
  */
-static void conn_init(void)
+static void CONN_ListInit(void)
 {
 	/* We're unlikely to see an FD much higher than maxconns. */
     sint32 s32NextFd = dup(1);
-    sint32 headroom = 10;      /* account for extra unexpected open FDs */
+    sint32 s32Headroom = 10;      /* account for extra unexpected open FDs */
 
 	struct rlimit rl;
 
-    gs32MaxFds = gstSettings.s32MaxConns + headroom + s32NextFd;
+    gs32MaxFds = gstSettings.s32MaxConns + s32Headroom + s32NextFd;
 
     /* But if possible, get the actual highest FD we can possibly ever see. */
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) 
@@ -126,7 +143,7 @@ static void conn_init(void)
     } 
 	else 
 	{
-        LOGFUNC(Err, False, "Failed to query maximum file descriptor; "
+        LOG_FUNC(Err, False, "Failed to query maximum file descriptor; "
                         "falling back to maxconns\n");
     }
 
@@ -134,85 +151,20 @@ static void conn_init(void)
 
     if ((ppstConnList = calloc(gs32MaxFds, sizeof(ST_CONN_INFO *))) == NULL) 
 	{
-		LOGFUNC(Err, True, "Failed to allocate connection structures\n");
+		LOG_FUNC(Err, True, "Failed to allocate connection structures\n");
         /* This is unrecoverable so bail out early. */
         exit(1);
     } 
 
-	LOGFUNC(Debug, False, "Max fds is %d\n", gs32MaxFds);
-}
-
-/*
- * We keep the current time of day in a global variable that's updated by a
- * timer event. This saves us a bunch of time() system calls (we really only
- * need to get the time once a second, whereas there can be tens of thousands
- * of requests a second) and allows us to use server-start-relative timestamps
- * rather than absolute UNIX timestamps, a space savings on systems where
- * sizeof(time_t) > sizeof(unsigned int).
- */
-volatile rel_time_t current_time;
-static struct event clockevent;
-
-/* libevent uses a monotonic clock when available for event scheduling. Aside
- * from jitter, simply ticking our internal timer here is accurate enough.
- * Note that users who are setting explicit dates for expiration times *must*
- * ensure their clocks are correct before starting relay. */
-static void clock_handler(const sint32 fd, const sint16 which, void *arg) 
-{
-    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
-    static bool initialized = false;
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    static bool monotonic = false;
-    static time_t monotonic_start;
-#endif
-    if (initialized) 
-	{
-        /* only delete the event if it's actually there. */
-        evtimer_del(&clockevent);
-    } 
-	else 
-	{
-        initialized = true;
-        /* process_started is initialized to time() - 2. We initialize to 1 so
-         * flush_all won't underflow during tests. */
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) 
-		{
-            monotonic = true;
-            monotonic_start = ts.tv_sec - UPDATE_INTERVAL - 2;
-        }
-#endif
-    }
-
-	//LOGFUNC(Debug, False, "current_time=%d\n", current_time);
-    evtimer_set(&clockevent, clock_handler, 0);
-    event_base_set(main_base, &clockevent);
-    evtimer_add(&clockevent, &t);
-
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    if (monotonic) 
-	{
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
-            return;
-        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
-        return;
-    }
-#endif
-    {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        current_time = (rel_time_t) (tv.tv_sec - process_started);
-    }
+	LOG_FUNC(Debug, False, "Max fds is %d\n", gs32MaxFds);
 }
 
 /**
  * Convert a state name to a human readable form.
  */
-static const char *state_text(EN_CONN_STAT state) 
+static const sint8 *CONN_StateText(EN_CONN_STAT enState) 
 {
-    const char* const statenames[] = { "enConnListening",
+    const sint8* const statenames[] = { "enConnListening",
                                        "enConnNewCmd",
                                        "enConnWaiting",
                                        "enConnRead",
@@ -223,7 +175,7 @@ static const char *state_text(EN_CONN_STAT state)
                                        "enConnClosing",
                                        //"conn_mwrite",
                                        "enConnClosed" };
-    return statenames[state];
+    return statenames[enState];
 }
 
 /*
@@ -231,64 +183,67 @@ static const char *state_text(EN_CONN_STAT state)
  * processing that needs to happen on certain state transitions can
  * happen here.
  */
-static void conn_set_state(ST_CONN_INFO *c, EN_CONN_STAT state) 
+static void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState) 
 {
-    assert(c != NULL);
-    assert(state >= enConnListening && state < enConnMaxState);
+    assert(pstConnInfo != NULL);
+    assert(enState >= enConnListening && enState < enConnMaxState);
 
-    if (state != c->enConnStat) 
+    if (enState != pstConnInfo->enConnStat) 
 	{
-        if (gstSettings.verbose) 
+        if (gstSettings.bVerbose) 
 		{
-            LOGFUNC(Debug, False, "%d: going from %s to %s\n",
-                    c->s32Sockfd, state_text(c->enConnStat),
-                    state_text(state));
+            LOG_FUNC(Debug, False, "%d: going from %s to %s\n",
+                    pstConnInfo->s32Sockfd, CONN_StateText(pstConnInfo->enConnStat),
+                    CONN_StateText(enState));
         }
 		
-        c->enConnStat = state;
+        pstConnInfo->enConnStat = enState;
     }
 }
 
-static void conn_close(ST_CONN_INFO *c) 
+static void CONN_SocketClose(ST_CONN_INFO *pstConnInfo) 
 {
-    assert(c != NULL);
+    assert(pstConnInfo != NULL);
 
     /* delete the event, the socket and the conn */
-    event_del(&c->event);
+    event_del(&pstConnInfo->evConnEvent);
 
-    if (gstSettings.verbose)
-        LOGFUNC(Err, False, "<%d connection closed.\n", c->s32Sockfd);
+    if (gstSettings.bVerbose)
+        LOG_FUNC(Err, False, "<%d connection closed.\n", pstConnInfo->s32Sockfd);
 
-    conn_set_state(c, enConnClosed);
-    close(c->s32Sockfd);
+    CONN_SetState(pstConnInfo, enConnClosed);
+    close(pstConnInfo->s32Sockfd);
+
+	STATS_LOCK();
+    gstStats.u32CurrConns--;
+    STATS_UNLOCK();
 	
     return;
 }
 
-
 /*
  * Frees a connection.
  */
-void conn_free(ST_CONN_INFO *c) 
+void CONN_NodeFree(ST_CONN_INFO *pstConnInfo) 
 {
-    if (c) 
+    if (pstConnInfo) 
 	{
-        assert(c != NULL);
-        assert(c->s32Sockfd >= 0 && c->s32Sockfd < gs32MaxFds);
+        assert(pstConnInfo != NULL);
+        assert(pstConnInfo->s32Sockfd >= 0 && pstConnInfo->s32Sockfd < gs32MaxFds);
 
-        ppstConnList[c->s32Sockfd] = NULL;
-        if (c->msglist)
-            free(c->msglist);
-        if (c->rbuf)
-            free(c->rbuf);
-        if (c->wbuf)
-            free(c->wbuf);
-        if (c->iov)
-            free(c->iov);
-        free(c);
+        ppstConnList[pstConnInfo->s32Sockfd] = NULL;
+        if (pstConnInfo->msglist)
+            free(pstConnInfo->msglist);
+        if (pstConnInfo->rbuf)
+            free(pstConnInfo->rbuf);
+        if (pstConnInfo->wbuf)
+            free(pstConnInfo->wbuf);
+        if (pstConnInfo->iov)
+            free(pstConnInfo->iov);
+        free(pstConnInfo);
     }
 }
-ST_CONN_INFO *conn_new(const sint32 sfd, EN_CONN_STAT init_state,
+ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
                 const sint32 event_flags,
                 const sint32 read_buffer_size,
                 struct event_base *base) 
@@ -301,7 +256,7 @@ ST_CONN_INFO *conn_new(const sint32 sfd, EN_CONN_STAT init_state,
 	{
         if (!(c = (ST_CONN_INFO *)calloc(1, sizeof(ST_CONN_INFO)))) 
 		{
-            LOGFUNC(Err, True, "Failed to allocate connection object\n");
+            LOG_FUNC(Err, True, "Failed to allocate connection object\n");
             return NULL;
         }
 
@@ -321,8 +276,8 @@ ST_CONN_INFO *conn_new(const sint32 sfd, EN_CONN_STAT init_state,
 
         if (c->rbuf == 0 || c->wbuf == 0 || c->iov == 0 || c->msglist == 0) 
 		{
-            conn_free(c);
-            LOGFUNC(Err, True, "Failed to allocate buffers for connection\n");
+            CONN_NodeFree(c);
+            LOG_FUNC(Err, True, "Failed to allocate buffers for connection\n");
             return NULL;
         }
 
@@ -332,20 +287,20 @@ ST_CONN_INFO *conn_new(const sint32 sfd, EN_CONN_STAT init_state,
 
     if (init_state == enConnNewCmd) 
 	{
-        if (getpeername(sfd, (struct sockaddr *) &c->request_addr,
-                        &c->request_addr_size)) 
+        if (getpeername(sfd, (struct sockaddr *) &c->requestAddr,
+                        &c->requestAddrSize)) 
 		{
-			LOGFUNC(Err, True, "getpeername error");
-            memset(&c->request_addr, 0, sizeof(c->request_addr));
+			LOG_FUNC(Err, True, "getpeername error");
+            memset(&c->requestAddr, 0, sizeof(c->requestAddr));
         }
-		c->request_addr_size = sizeof(c->request_addr);
+		c->requestAddrSize = sizeof(c->requestAddr);
     }
 
-    if (gstSettings.verbose) 
+    if (gstSettings.bVerbose) 
 	{
         if (init_state == enConnListening) 
 		{
-            LOGFUNC(Info, False, "<%d server listening\n", sfd);
+            LOG_FUNC(Info, False, "<%d server listening\n", sfd);
         } 
     }
 
@@ -358,61 +313,23 @@ ST_CONN_INFO *conn_new(const sint32 sfd, EN_CONN_STAT init_state,
     c->msgcurr = 0;
     c->msgused = 0;
 
-    event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
-    event_base_set(base, &c->event);
-    c->ev_flags = event_flags;
+    event_set(&c->evConnEvent, sfd, event_flags, EVENT_ConnHandler, (void *)c);
+    event_base_set(base, &c->evConnEvent);
+    c->s16Evflags = event_flags;
 
-    if (event_add(&c->event, 0) == -1) 
+    if (event_add(&c->evConnEvent, 0) == -1) 
 	{
-        LOGFUNC(Err, True, "event_add");
+        LOG_FUNC(Err, True, "event_add");
         return NULL;
     }
 
+	STATS_LOCK();
+    gstStats.u32CurrConns++;
+    gstStats.u32TotalConns++;
+    STATS_UNLOCK();
+	
     return c;
 }
-
-void event_handler(const int fd, const short which, void *arg) 
-{
-    ST_CONN_INFO *c;
-
-    c = (ST_CONN_INFO *)arg;
-    assert(c != NULL);
-
-    /* sanity */
-    if (fd != c->s32Sockfd)
-	{
-        if (gstSettings.verbose)
-            LOGFUNC(Debug, False, "Catastrophic: event fd doesn't match conn fd!\n");
-        conn_close(c);
-        return;
-    }
-
-    drive_machine(c);
-
-    /* wait for next event */
-    return;
-}
-
-static int new_socket(struct addrinfo *ai) 
-{
-    int sfd;
-    int flags;
-
-    if ((sfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1) 
-	{
-        return -1;
-    }
-
-    if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
-        fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0)
-    {
-		LOGFUNC(Err, False, "setting O_NONBLOCK");
-        close(sfd);
-        return -1;
-    }
-    return sfd;
-}
-
 
 /**
  * Create a socket and bind it to a specific port number
@@ -423,7 +340,7 @@ static int new_socket(struct addrinfo *ai)
  *        when they are successfully added to the list of ports we
  *        listen on.
  */
-static int server_socket(const char *interface, int port) 
+static int CONN_ServerSocket(const char *interface, sint32 port) 
 {
     int sfd;
     struct linger ling = {0, 0};
@@ -450,19 +367,19 @@ static int server_socket(const char *interface, int port)
 	{
         if (error != EAI_SYSTEM)
         {
-			LOGFUNC(Err, False, "getaddrinfo(): %s\n", gai_strerror(error));
+			LOG_FUNC(Err, False, "getaddrinfo(): %s\n", gai_strerror(error));
         }
         else
         {
-			LOGFUNC(Err, False, "getaddrinfo()");
+			LOG_FUNC(Err, False, "getaddrinfo()");
         }
         return 1;
     }
 
     for (next= ai; next; next= next->ai_next) 
 	{
-        ST_CONN_INFO *listen_conn_add;
-        if ((sfd = new_socket(next)) == -1) 
+        ST_CONN_INFO *pstListenConnAdd;
+        if ((sfd = CONN_NewSocket(next)) == -1) 
 		{
             /* getaddrinfo can return "junk" addresses,
 	             * we make sure at least one works before erroring.
@@ -470,7 +387,7 @@ static int server_socket(const char *interface, int port)
             if (errno == EMFILE)
 			{
                 /* ...unless we're out of fds */
-                LOGFUNC(Err, False, "server_socket");
+                LOG_FUNC(Err, False, "CONN_ServerSocket");
                 exit(-1);
             }
             continue;
@@ -482,22 +399,22 @@ static int server_socket(const char *interface, int port)
 		{
             error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
             if (error != 0)
-                LOGFUNC(Err, False, "setsockopt");
+                LOG_FUNC(Err, False, "setsockopt");
 
             error = setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
             if (error != 0)
-                LOGFUNC(Err, False, "setsockopt");
+                LOG_FUNC(Err, False, "setsockopt");
 
             error = setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
             if (error != 0)
-                LOGFUNC(Err, False, "setsockopt");
+                LOG_FUNC(Err, False, "setsockopt");
         }
 
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) 
 		{
             if (errno != EADDRINUSE) 
 			{
-                LOGFUNC(Err, False, "bind()");
+                LOG_FUNC(Err, False, "bind()");
                 close(sfd);
                 freeaddrinfo(ai);
                 return 1;
@@ -510,7 +427,7 @@ static int server_socket(const char *interface, int port)
             success++;
             if (listen(sfd, gstSettings.s32Backlog) == -1) 
 			{
-                LOGFUNC(Err, False, "listen()");
+                LOG_FUNC(Err, False, "listen()");
                 close(sfd);
                 freeaddrinfo(ai);
                 return 1;
@@ -518,15 +435,15 @@ static int server_socket(const char *interface, int port)
         }
 
 		{
-            if (!(listen_conn_add = conn_new(sfd, enConnListening,
+            if (!(pstListenConnAdd = CONN_NodeNew(sfd, enConnListening,
                                              EV_READ | EV_PERSIST, 1,
-                                              main_base))) 
+                                              gebMainBase))) 
 			{
-                LOGFUNC(Err, False, "failed to create listening connection\n");
+                LOG_FUNC(Err, False, "failed to create listening connection\n");
                 exit(1);
             }
-            listen_conn_add->pstConnNext = listen_conn;
-            listen_conn = listen_conn_add;
+            pstListenConnAdd->pstConnNext = gpstListenConnList;
+            gpstListenConnList = pstListenConnAdd;
         }
     }
 
@@ -536,13 +453,336 @@ static int server_socket(const char *interface, int port)
     return success == 0;
 }
 
-static void drive_machine(ST_CONN_INFO *c)
+
+/**
+ * Do basic sanity check of the runtime environment
+ * @return true if no errors found, false if we can't use this env
+ */
+static bool EVENT_Sanitycheck(void) 
+{
+    /* One of our biggest problems is old and bogus libevents */
+    const char *ever = event_get_version();
+    if (ever != NULL) 
+	{
+        if (strncmp(ever, "1.", 2) == 0) 
+		{
+            /* Require at least 1.3 (that's still a couple of years old) */
+            if (('0' <= ever[2] && ever[2] < '3') && !isdigit(ever[3])) 
+			{
+                LOG_FUNC(Err, False, "You are using libevent %s.\nPlease upgrade to"
+                        " a more recent version (1.3 or newer)\n", event_get_version());
+                return false;
+            }
+        }
+    }
+
+	LOG_FUNC(Info, False, "current libevent version is %s \n", event_get_version());
+    return true;
+}
+
+
+/* libevent uses a monotonic clock when available for event scheduling. Aside
+ * from jitter, simply ticking our internal timer here is accurate enough.
+ * Note that users who are setting explicit dates for expiration times *must*
+ * ensure their clocks are correct before starting relay. */
+static void EVENT_ClockHandler(const sint32 fd, const sint16 which, void *arg) 
+{
+    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
+    static bool initialized = false;
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    static bool monotonic = false;
+    static time_t monotonic_start;
+#endif
+    if (initialized) 
+	{
+        /* only delete the event if it's actually there. */
+        evtimer_del(&gevClockevent);
+    } 
+	else 
+	{
+        initialized = true;
+        /* grtProcessStarted is initialized to time() - 2. We initialize to 1 so
+         * flush_all won't underflow during tests. */
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) 
+		{
+            monotonic = true;
+            monotonic_start = ts.tv_sec - UPDATE_INTERVAL - 2;
+        }
+#endif
+    }
+
+	//LOG_FUNC(Debug, False, "grtCurrentTime=%d\n", grtCurrentTime);
+    evtimer_set(&gevClockevent, EVENT_ClockHandler, 0);
+    event_base_set(gebMainBase, &gevClockevent);
+    evtimer_add(&gevClockevent, &t);
+
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    if (monotonic) 
+	{
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+            return;
+        grtCurrentTime = (rel_time_t) (ts.tv_sec - monotonic_start);
+        return;
+    }
+#endif
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        grtCurrentTime = (rel_time_t) (tv.tv_sec - grtProcessStarted);
+    }
+}
+
+/*
+ * Shrinks a connection's buffers if they're too big.  This prevents
+ * periodic large "get" requests from permanently chewing lots of server
+ * memory.
+ *
+ * This should only be called in between requests since it can wipe output
+ * buffers!
+ */
+static void EVENT_BufferShrink(ST_CONN_INFO *c) 
+{
+    assert(c != NULL);
+
+    if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE)
+	{
+        char *newbuf;
+
+        if (c->rcurr != c->rbuf)
+            memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
+
+        newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
+
+        if (newbuf) 
+		{
+            c->rbuf = newbuf;
+            c->rsize = DATA_BUFFER_SIZE;
+        }
+        /* TODO check other branch... */
+        c->rcurr = c->rbuf;
+    }
+
+    /* TODO check error condition? */
+    if (c->msgsize > MSG_LIST_HIGHWAT) 
+	{
+        struct msghdr *newbuf = (struct msghdr *) realloc((void *)c->msglist, MSG_LIST_INITIAL * sizeof(c->msglist[0]));
+        if (newbuf) 
+		{
+            c->msglist = newbuf;
+            c->msgsize = MSG_LIST_INITIAL;
+        }
+    /* TODO check error condition? */
+    }
+
+    if (c->iovsize > IOV_LIST_HIGHWAT)
+	{
+        struct iovec *newbuf = (struct iovec *) realloc((void *)c->iov, IOV_LIST_INITIAL * sizeof(c->iov[0]));
+        if (newbuf) 
+		{
+            c->iov = newbuf;
+            c->iovsize = IOV_LIST_INITIAL;
+        }
+    /* TODO check return value */
+    }
+}
+
+static void EVENT_ResetCmdHandler(ST_CONN_INFO *c) 
+{
+    c->cmd = -1;
+    
+    EVENT_BufferShrink(c);
+    if (c->rbytes > 0)
+	{
+        CONN_SetState(c, enConnParseCmd);
+    } 
+	else 
+	{
+        CONN_SetState(c, enConnWaiting);
+    }
+}
+
+static bool EVENT_UpdateEvent(ST_CONN_INFO *c, const sint32 new_flags) 
+{
+    assert(c != NULL);
+
+    struct event_base *base = c->evConnEvent.ev_base;
+    if (c->s16Evflags == new_flags)
+        return true;
+    if (event_del(&c->evConnEvent) == -1) 
+		return false;
+    event_set(&c->evConnEvent, c->s32Sockfd, new_flags, EVENT_ConnHandler, (void *)c);
+    event_base_set(base, &c->evConnEvent);
+    c->s16Evflags = new_flags;
+    if (event_add(&c->evConnEvent, 0) == -1) 
+		return false;
+    return true;
+}
+
+/*
+ * read from network as much as we can, handle buffer overflow and connection
+ * close.
+ * before reading, move the remaining incomplete fragment of a command
+ * (if any) to the beginning of the buffer.
+ *
+ * To protect us from someone flooding a connection with bogus data causing
+ * the connection to eat up all available memory, break out and start looking
+ * at the data I've got after a number of reallocs...
+ *
+ * @return enum try_read_result
+ */
+static EN_TRYREAD_RET EVENT_TryReadNetwork(ST_CONN_INFO *c) 
+{
+    EN_TRYREAD_RET gotdata = READ_NO_DATA_RECEIVED;
+    int res;
+    int num_allocs = 0;
+    assert(c != NULL);
+
+    if (c->rcurr != c->rbuf) 
+	{
+        if (c->rbytes != 0) /* otherwise there's nothing to copy */
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+        c->rcurr = c->rbuf;
+    }
+
+    while (1) 
+	{
+        if (c->rbytes >= c->rsize) 
+		{
+            if (num_allocs == 4) 
+			{
+                return gotdata;
+            }
+            ++num_allocs;
+            char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
+            if (!new_rbuf) 
+			{ 
+                if (gstSettings.bVerbose > 0) 
+				{
+                    LOG_FUNC(Err, False, "Couldn't realloc input buffer\n");
+                }
+                c->rbytes = 0; /* ignore what we read */
+                //out_of_memory(c, "SERVER_ERROR out of memory reading request");
+                c->write_and_go = enConnClosing;
+                return READ_MEMORY_ERROR;
+            }
+            c->rcurr = c->rbuf = new_rbuf;
+            c->rsize *= 2;
+        }
+
+        int avail = c->rsize - c->rbytes;
+        res = read(c->s32Sockfd, c->rbuf + c->rbytes, avail);
+        if (res > 0) 
+		{
+            gotdata = READ_DATA_RECEIVED;
+            c->rbytes += res;
+            if (res == avail) 
+			{
+                continue;
+            } 
+			else 
+           	{
+                break;
+            }
+        }
+        if (res == 0) 
+		{
+            return READ_ERROR;
+        }
+        if (res == -1) 
+		{
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+                break;
+            }
+            return READ_ERROR;
+        }
+    }
+    return gotdata;
+}
+
+/*
+ * if we have a complete line in the buffer, process it.
+ */
+static sint32 try_read_command(ST_CONN_INFO *c) 
+{
+    assert(c != NULL);
+    assert(c->rcurr <= (c->rbuf + c->rsize));
+    assert(c->rbytes > 0);
+
+    if (c->protocol == negotiating_prot || c->transport == udp_transport)  {
+        if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
+            c->protocol = binary_prot;
+        } else {
+            c->protocol = ascii_prot;
+        }
+
+        if (settings.verbose > 1) {
+            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+                    prot_text(c->protocol));
+        }
+    }
+
+   	{
+        char *el, *cont;
+
+        if (c->rbytes == 0)
+            return 0;
+
+        el = memchr(c->rcurr, '\n', c->rbytes);
+        if (!el) {
+            if (c->rbytes > 1024) {
+                /*
+                 * We didn't have a '\n' in the first k. This _has_ to be a
+                 * large multiget, if not we should just nuke the connection.
+                 */
+                char *ptr = c->rcurr;
+                while (*ptr == ' ') { /* ignore leading whitespaces */
+                    ++ptr;
+                }
+
+                if (ptr - c->rcurr > 100 ||
+                    (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5))) {
+
+                    conn_set_state(c, conn_closing);
+                    return 1;
+                }
+            }
+
+            return 0;
+        }
+        cont = el + 1;
+        if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
+            el--;
+        }
+        *el = '\0';
+
+        assert(cont <= (c->rcurr + c->rbytes));
+
+        c->last_cmd_time = current_time;
+        process_command(c, c->rcurr);
+
+        c->rbytes -= (cont - c->rcurr);
+        c->rcurr = cont;
+
+        assert(c->rcurr <= (c->rbuf + c->rsize));
+    }
+
+    return 1;
+}
+
+
+static void EVENT_DriveMachine(ST_CONN_INFO *c)
 {
 	bool stop = false;
     sint32 		sfd;
     socklen_t 	addrlen;
     struct sockaddr_storage addr;
-    //sint32 nreqs = gstSettings.s32ReqsPerEvent;
+	sint32 	s32Ret;
+    const sint8 *pstr;
+    sint32 nreqs = gstSettings.s32ReqsPerEvent;
     //sint32 res;
     //const sint8 *str;
 
@@ -564,13 +804,13 @@ static void drive_machine(ST_CONN_INFO *c)
 	                } 
 					else if (errno == EMFILE) 
 					{
-	                    if (gstSettings.verbose)
-	                        LOGFUNC(Debug, False, "Too many open connections\n"); 
+	                    if (gstSettings.bVerbose)
+	                        LOG_FUNC(Debug, False, "Too many open connections\n"); 
 	                    stop = true;
 	                } 
 					else 
 					{
-						LOGFUNC(Err, True, "accept error");
+						LOG_FUNC(Err, True, "accept error");
 	                    stop = true;
 	                }
 	                break;
@@ -578,28 +818,133 @@ static void drive_machine(ST_CONN_INFO *c)
 
 				if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) 
 				{
-                    LOGFUNC(Err, True, "setting O_NONBLOCK");
+                    LOG_FUNC(Err, True, "setting O_NONBLOCK");
                     close(sfd);
                     break;
                 }
-				LOGFUNC(Debug, False, "accept a connect\n"); 
+				LOG_FUNC(Debug, False, "accept a connect\n"); 
 
-				dispatch_conn_new(sfd, enConnNewCmd, EV_READ | EV_PERSIST,
+				if(gstStats.u32CurrConns + gstStats.u32ReservedFds >= gstSettings.s32MaxConns)
+				{
+					pstr = "ERROR: Too many open connections\r\n";
+					s32Ret = write(sfd, pstr, strlen(pstr));
+					close(sfd);
+				}
+				else
+				{
+					THREAD_DispatchConnNew(sfd, enConnNewCmd, EV_READ | EV_PERSIST,
                                      DATA_BUFFER_SIZE);
+				}
+				stop = true;
+				break;
+				
 			case enConnNewCmd:
+				/* Only process nreqs at a time to avoid starving other
+               		connections */
+               	--nreqs;
+            	if (nreqs >= 0)
+				{
+                	EVENT_ResetCmdHandler(c);	
+            	}
+				else
+				{
+					if (c->rbytes > 0) 
+					{
+	                    /* We have already read in data into the input buffer,
+			                       so libevent will most likely not signal read events
+			                       on the socket (unless more data is available. As a
+			                       hack we should just put in a request to write data,
+			                       because that should be possible ;-)
+			                    */
+	                    if (!EVENT_UpdateEvent(c, EV_WRITE | EV_PERSIST))
+						{
+	                        if (gstSettings.bVerbose > 0)
+	                            LOG_FUNC(Err, True, "Couldn't update event\n");
+	                        CONN_SetState(c, enConnClosing);
+	                        break;
+	                    }
+                	}
+                	stop = true;
+				}
+				break;
 			case enConnWaiting:
+				if (!EVENT_UpdateEvent(c, EV_READ | EV_PERSIST))
+				{
+	                if (gstSettings.bVerbose > 0)
+	                    LOG_FUNC(Err, True, "Couldn't update event\n");
+	                CONN_SetState(c, enConnClosing);
+	                break;
+            	}
+
+            	CONN_SetState(c, enConnRead);
+            	stop = true;
+           	 	break;
 			case enConnRead:
+				s32Ret = EVENT_TryReadNetwork(c);
+				switch(s32Ret)
+				{
+					 case READ_NO_DATA_RECEIVED:
+		                CONN_SetState(c, enConnWaiting);
+		                break;
+		            case READ_DATA_RECEIVED:
+		                CONN_SetState(c, enConnParseCmd);
+		                break;
+		            case READ_ERROR:
+		                CONN_SetState(c, enConnClosing);
+		                break;
+		            case READ_MEMORY_ERROR: /* Failed to allocate more memory */
+		                /* State already set by try_read_network */
+		                break;
+            	}
+           		break; 
 			case enConnParseCmd:
+				LOG_FUNC(Debug, False, "recv msg = %s\n", c->rbuf);
+				
+				c->rcurr = c->rbuf;
+				c->rbytes = 0;
+				CONN_SetState(c, enConnWaiting);
+				break;
 			case enConnWrite:
 			case enConnClosing:
+				LOG_FUNC(Debug, False, "current stat is %s\n", CONN_StateText(c->enConnStat));
+				CONN_SocketClose(c);
+            	stop = true;
+            	break;
 			case enConnClosed:
+				LOG_FUNC(Debug, False, "current stat is %s\n", CONN_StateText(c->enConnStat));
+				/* This only happens if dormando is an idiot. */
+            	abort();
+            	break;
+			case enConnMaxState:
 			default :
-				LOGFUNC(Debug, False, "current stat is %s\n", state_text(c->enConnStat));
+				assert(false);
+				LOG_FUNC(Debug, False, "current stat is %s\n", CONN_StateText(c->enConnStat));
 				break;
 		}
 	}
 }
 
+void EVENT_ConnHandler(const sint32 fd, const sint16 which, void *arg) 
+{
+    ST_CONN_INFO *c;
+
+    c = (ST_CONN_INFO *)arg;
+    assert(c != NULL);
+
+    /* sanity */
+    if (fd != c->s32Sockfd)
+	{
+        if (gstSettings.bVerbose)
+            LOG_FUNC(Debug, False, "Catastrophic: event fd doesn't match conn fd!\n");
+        CONN_SocketClose(c);
+        return;
+    }
+
+    EVENT_DriveMachine(c);
+
+    /* wait for next event */
+    return;
+}
 
 int main(int argc, char *argv[])
 {
@@ -609,21 +954,22 @@ int main(int argc, char *argv[])
 	LOG_Init();
 	#endif
 	
-	LOGFUNC(Info, False, "replay server start!\n");
+	LOG_FUNC(Info, False, "replay server start!\n");
 
-	if (!sanitycheck())
+	if (!EVENT_Sanitycheck())
 	{
 		return FAIL;
 	}
 
-	settings_init();
+	SETTINGS_Init();
+	STATS_Init();
 	/*
      * If needed, increase rlimits to allow as many connections
      * as needed.
      */
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) 
 	{
-        LOGFUNC(Err, False, "failed to getrlimit number of files\n");
+        LOG_FUNC(Err, False, "failed to getrlimit number of files\n");
         exit(-1);
     } 
 	else 
@@ -632,24 +978,24 @@ int main(int argc, char *argv[])
         rlim.rlim_max = gstSettings.s32MaxConns;
         if (setrlimit(RLIMIT_NOFILE, &rlim) != 0)
 		{
-            LOGFUNC(Err, False, "failed to set rlimit for open files. Try starting as root or requesting smaller maxconns value.\n");
+            LOG_FUNC(Err, False, "failed to set rlimit for open files. Try starting as root or requesting smaller maxconns value.\n");
             exit(-1);
         }
     }
 
 	/* initialize main thread libevent instance */
-    main_base = event_init();
+    gebMainBase = event_init();
 
 	/* initialize*/
-	conn_init();
+	CONN_ListInit();
 	
-	relaysrv_thread_init(gstSettings.s32ThreadNum, main_base);
+	THERAD_RelaysrvInit(gstSettings.s32ThreadNum, gebMainBase);
 
-	server_socket(NULL, 11211);
+	CONN_ServerSocket(NULL, 11211);
 
-	clock_handler(0,0,0);
+	EVENT_ClockHandler(0,0,0);
 	/* enter the event loop */
-    if (event_base_loop(main_base, 0) != 0) {
+    if (event_base_loop(gebMainBase, 0) != 0) {
         exit(-1);
     }
 	

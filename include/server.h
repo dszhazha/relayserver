@@ -31,6 +31,11 @@
 /** Initial number of sendmsg() argument structures to allocate. */
 #define MSG_LIST_INITIAL 10
 
+/** High water marks for buffer shrinking */
+#define READ_BUFFER_HIGHWAT 8192
+#define IOV_LIST_HIGHWAT 600
+#define MSG_LIST_HIGHWAT 100
+
 /**
  * Possible states of a connection.
  */
@@ -50,11 +55,20 @@ typedef enum connectionStates
     enConnMaxState   	/**< Max state value (used for assertion) */
 }EN_CONN_STAT;
 
+typedef enum try_read_result 
+{
+    READ_DATA_RECEIVED,
+    READ_NO_DATA_RECEIVED,
+    READ_ERROR,            /** an error occurred (on the socket) (or client closed connection) */
+    READ_MEMORY_ERROR      /** failed to allocate more memory */
+}EN_TRYREAD_RET;
+
+
 typedef struct libeventThread
 {
-    pthread_t thread_id;        /* unique ID of this thread */
+    pthread_t threadId;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
-    struct event notify_event;  /* listen event for notify pipe */
+    struct event evNotifyEvent;  /* listen event for notify pipe */
     sint32 s32NotifyReceiveFd;      /* receiving end of notify pipe */
     sint32 s32NotifySendFd;         /* sending end of notify pipe */
     struct conn_queue *new_conn_queue; /* queue of new connections to handle */
@@ -64,16 +78,17 @@ typedef struct libeventThread
 /**
  * The structure representing a connection into replay server.
  */
-typedef struct connectInformation ST_CONN_INFO;
-struct connectInformation
+typedef struct connectInformation
 {
 	sint32	s32Sockfd;
-	struct event event;
-	sint16  ev_flags;
+	struct event evConnEvent;
+	sint16  s16Evflags;
 	
-	rel_time_t	last_cmd_time;
+	rel_time_t	lastCmdTime;
 
 	EN_CONN_STAT	enConnStat;
+	 /** which state to go into after finishing current write */
+    EN_CONN_STAT  write_and_go;
 
 	/*read buffer struct*/
 	sint8   *rbuf;   /** buffer to read commands into */
@@ -89,30 +104,41 @@ struct connectInformation
 
 	/* data for the mwrite state */
     struct iovec *iov;
-    int    iovsize;   /* number of elements allocated in iov[] */
-    int    iovused;   /* number of elements used in iov[] */
+    sint32    iovsize;   /* number of elements allocated in iov[] */
+    sint32    iovused;   /* number of elements used in iov[] */
 
     struct msghdr *msglist;
-    int    msgsize;   /* number of elements allocated in msglist[] */
-    int    msgused;   /* number of elements used in msglist[] */
-    int    msgcurr;   /* element in msglist[] being transmitted now */
-    int    msgbytes;  /* number of bytes in current msg */
+    sint32    msgsize;   /* number of elements allocated in msglist[] */
+    sint32    msgused;   /* number of elements used in msglist[] */
+    sint32    msgcurr;   /* element in msglist[] being transmitted now */
+    sint32    msgbytes;  /* number of bytes in current msg */
 
-	struct sockaddr_in request_addr;
-    socklen_t request_addr_size;
+	struct sockaddr_in requestAddr;
+    socklen_t requestAddrSize;
 
-	ST_CONN_INFO		*pstConnNext;
+	sint16 	  cmd; /* current command being processed */
+
+	struct connectInformation		*pstConnNext;
 	ST_LIBEVENT_THREAD	*pstThread;
-};
+}ST_CONN_INFO;
 
-typedef struct replaySettings
+typedef struct relaySettings
 {
 	sint32 		s32MaxConns;	/*Maximum connect number*/
-	bool		verbose;		/*display detail debug information*/
+	bool		bVerbose;		/*display detail debug information*/
 	sint32		s32ThreadNum; 	/* number of worker (without dispatcher) libevent threads to run */
 	sint32		s32Backlog;	
 	sint32 		s32ReqsPerEvent;     /* Maximum number of io to process on each io-event. */
-}ST_REPLAY_SETTINGS;
+}ST_RELAY_SETTINGS;
 
-extern ST_REPLAY_SETTINGS	gstSettings;
+typedef struct relayStatus
+{
+	uint32		u32ReservedFds;
+	uint32  	u32CurrConns;
+    uint32  	u32TotalConns;
+	
+}ST_RELAY_STATUS;
+
+
+extern ST_RELAY_SETTINGS	gstSettings;
 

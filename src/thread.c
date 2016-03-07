@@ -27,10 +27,10 @@
 
 typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
-    int               	sfd;
+    sint32               	sfd;
     EN_CONN_STAT  		init_state;
-    int               	event_flags;
-    int               	read_buffer_size;
+    sint32               	event_flags;
+    sint32               	read_buffer_size;
     CQ_ITEM          	*next;
 };
 
@@ -49,21 +49,49 @@ static pthread_mutex_t worker_hang_lock;
 static CQ_ITEM *cqi_freelist;
 static pthread_mutex_t cqi_freelist_lock;
 
+/* Lock for global stats */
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
 /*
  * Number of worker threads that have finished setting themselves up.
  */
-static int init_count = 0;
+static sint32 init_count = 0;
 static pthread_mutex_t init_lock;
 static pthread_cond_t init_cond;
 
-extern ST_CONN_INFO *conn_new(const sint32 sfd, EN_CONN_STAT init_state,
+/* Which thread we assigned a connection to most recently. */
+static int last_thread = -1;
+
+//static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
+
+/*
+ * Each libevent instance has a wakeup pipe, which other threads
+ * can use to signal that they've put a new connection on its queue.
+ */
+static ST_LIBEVENT_THREAD *pstThreads;
+
+extern ST_RELAY_STATUS		gstStats;
+
+extern ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
                 const sint32 event_flags,
                 const sint32 read_buffer_size,
                 struct event_base *base); 
 
-static void thread_libevent_process(int fd, short which, void *arg) ;
+static void THREAD_LibeventProcess(sint32 fd, sint16 which, void *arg);
 
-static void wait_for_thread_registration(int nthreads) 
+
+void STATS_LOCK(void) 
+{
+    pthread_mutex_lock(&stats_lock);
+}
+
+void STATS_UNLOCK(void) 
+{
+    pthread_mutex_unlock(&stats_lock);
+}
+
+static void THREAD_WaitForRegistration(sint32 nthreads) 
 {
     while (init_count < nthreads) 
 	{
@@ -71,7 +99,7 @@ static void wait_for_thread_registration(int nthreads)
     }
 }
 
-static void register_thread_initialized(void) 
+static void THREAD_RegisterInitialized(void) 
 {
     pthread_mutex_lock(&init_lock);
     init_count++;
@@ -174,7 +202,8 @@ static CQ_ITEM *cqi_new(void)
 /*
  * Frees a connection queue item (adds it to the freelist.)
  */
-static void cqi_free(CQ_ITEM *item) {
+static void cqi_free(CQ_ITEM *item) 
+{
     pthread_mutex_lock(&cqi_freelist_lock);
     item->next = cqi_freelist;
     cqi_freelist = item;
@@ -184,56 +213,49 @@ static void cqi_free(CQ_ITEM *item) {
 /*
  * Creates a worker thread.
  */
-static void create_worker(void *(*func)(void *), void *arg)
+static void THREAD_CreateWorker(void *(*func)(void *), void *arg)
 {
     pthread_attr_t  attr;
     int             ret;
 
     pthread_attr_init(&attr);
 
-    if ((ret = pthread_create(&((ST_LIBEVENT_THREAD*)arg)->thread_id, &attr, func, arg)) != 0)
+    if ((ret = pthread_create(&((ST_LIBEVENT_THREAD*)arg)->threadId, &attr, func, arg)) != 0)
 	{
-        LOGFUNC(Err, True, "Can't create thread\n");
+        LOG_FUNC(Err, True, "Can't create thread\n");
         exit(1);
     }
 }
 
-//static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
-
-/*
- * Each libevent instance has a wakeup pipe, which other threads
- * can use to signal that they've put a new connection on its queue.
- */
-static ST_LIBEVENT_THREAD *pstThreads;
 
 /****************************** LIBEVENT THREADS *****************************/
 /*
  * Set up a thread's information.
  */
-static void setup_thread(ST_LIBEVENT_THREAD *me) 
+static void THREAD_SetupThread(ST_LIBEVENT_THREAD *me) 
 {
     me->base = event_init();
     if (! me->base) 
 	{
-        LOGFUNC(Err, False, "Can't allocate event base\n");
+        LOG_FUNC(Err, False, "Can't allocate event base\n");
         exit(1);
     }
 
     /* Listen for notifications from other threads */
-    event_set(&me->notify_event, me->s32NotifyReceiveFd,
-              EV_READ | EV_PERSIST, thread_libevent_process, me);
-    event_base_set(me->base, &me->notify_event);
+    event_set(&me->evNotifyEvent, me->s32NotifyReceiveFd,
+              EV_READ | EV_PERSIST, THREAD_LibeventProcess, me);
+    event_base_set(me->base, &me->evNotifyEvent);
 
-    if (event_add(&me->notify_event, 0) == -1) 
+    if (event_add(&me->evNotifyEvent, 0) == -1) 
 	{
-        LOGFUNC(Err, False, "Can't monitor libevent notify pipe\n");
+        LOG_FUNC(Err, False, "Can't monitor libevent notify pipe\n");
         exit(1);
     }
 
     me->new_conn_queue = malloc(sizeof(struct conn_queue));
     if (me->new_conn_queue == NULL) 
 	{
-        LOGFUNC(Err, False, "Failed to allocate memory for connection queue");
+        LOG_FUNC(Err, False, "Failed to allocate memory for connection queue");
         exit(1);
     }
     cq_init(me->new_conn_queue);
@@ -242,7 +264,7 @@ static void setup_thread(ST_LIBEVENT_THREAD *me)
 /*
  * Worker thread: main event loop
  */
-static void *worker_libevent(void *arg) 
+static void *THREAD_WorkerLibevent(void *arg) 
 {
     ST_LIBEVENT_THREAD *me = arg;
 
@@ -250,7 +272,7 @@ static void *worker_libevent(void *arg)
      * all threads have finished initializing.
      */
 
-    register_thread_initialized();
+    THREAD_RegisterInitialized();
 
     event_base_loop(me->base, 0);
     return NULL;
@@ -260,15 +282,15 @@ static void *worker_libevent(void *arg)
  * Processes an incoming "handle a new connection" item. This is called when
  * input arrives on the libevent wakeup pipe.
  */
-static void thread_libevent_process(int fd, short which, void *arg) 
+static void THREAD_LibeventProcess(sint32 fd, sint16 which, void *arg) 
 {
     ST_LIBEVENT_THREAD *me = arg;
     CQ_ITEM *item;
     char buf[1];
 
     if (read(fd, buf, 1) != 1)
-        if (gstSettings.verbose)
-            LOGFUNC(Err, False, "Can't read from libevent pipe\n");
+        if (gstSettings.bVerbose)
+            LOG_FUNC(Err, False, "Can't read from libevent pipe\n");
 
     switch (buf[0]) 
 	{
@@ -276,13 +298,13 @@ static void thread_libevent_process(int fd, short which, void *arg)
 		    item = cq_pop(me->new_conn_queue);
 		    if (NULL != item) 
 			{
-		        ST_CONN_INFO *c = conn_new(item->sfd, item->init_state, item->event_flags,
+		        ST_CONN_INFO *c = CONN_NodeNew(item->sfd, item->init_state, item->event_flags,
 		                           item->read_buffer_size, me->base);
 		        if (c == NULL) 
 				{  
-					if (gstSettings.verbose > 0) 
+					if (gstSettings.bVerbose) 
 					{
-						LOGFUNC(Err, False, "Can't listen for events on fd %d\n",
+						LOG_FUNC(Err, False, "Can't listen for events on fd %d\n",
 						item->sfd);
 					}
 					close(item->sfd);
@@ -293,11 +315,11 @@ static void thread_libevent_process(int fd, short which, void *arg)
 		        }
 		        cqi_free(item);
 		    }
-			LOGFUNC(Debug, False, "Thread %ld recv a connet\n", me->thread_id);
+			LOG_FUNC(Debug, False, "Thread %lu recv a connet\n", me->threadId);
 			break;
     	/* we were told to pause and report in */
     	case 'p':
-    		register_thread_initialized();
+    		THREAD_RegisterInitialized();
         break;
     }
 }
@@ -306,9 +328,9 @@ static void thread_libevent_process(int fd, short which, void *arg)
  * Initializes the thread subsystem, creating various worker threads.
  *
  * nthreads  Number of worker event handler threads to spawn
- * main_base Event base for main thread
+ * gebMainBase Event base for main thread
  */
-void relaysrv_thread_init(int nthreads, struct event_base *main_base) 
+void THERAD_RelaysrvInit(sint32 nthreads, struct event_base *main_base) 
 {
     int         i;
     //int         power;
@@ -324,51 +346,50 @@ void relaysrv_thread_init(int nthreads, struct event_base *main_base)
     pstThreads = calloc(nthreads, sizeof(ST_LIBEVENT_THREAD));
     if (! pstThreads) 
 	{
-        LOGFUNC(Err, False, "Can't allocate thread descriptors");
+        LOG_FUNC(Err, False, "Can't allocate thread descriptors");
         exit(1);
     }
 
-    //dispatcher_thread.base = main_base;
-    //dispatcher_thread.thread_id = pthread_self();
+    //dispatcher_thread.base = gebMainBase;
+    //dispatcher_thread.threadId = pthread_self();
 
     for (i = 0; i < nthreads; i++) 
 	{
         int fds[2];
         if (pipe(fds)) 
 		{
-            LOGFUNC(Err, False, "Can't create notify pipe");
+            LOG_FUNC(Err, False, "Thread %d: Can't create notify pipe", i);
             exit(1);
         }
 
         pstThreads[i].s32NotifyReceiveFd = fds[0];
         pstThreads[i].s32NotifySendFd = fds[1];
 
-        setup_thread(&pstThreads[i]);
-        
+        THREAD_SetupThread(&pstThreads[i]);
+		
+        /* Reserve three fds for the libevent base, and two for the pipe */
+        gstStats.u32ReservedFds += 5;
     }
 
 	/* Create threads after we've done all the libevent setup. */
     for (i = 0; i < nthreads; i++) 
 	{
-        create_worker(worker_libevent, &pstThreads[i]);
+        THREAD_CreateWorker(THREAD_WorkerLibevent, &pstThreads[i]);
     }
 
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);
-    wait_for_thread_registration(nthreads);
+    THREAD_WaitForRegistration(nthreads);
     pthread_mutex_unlock(&init_lock);
 }
-
-/* Which thread we assigned a connection to most recently. */
-static int last_thread = -1;
 
 /*
  * Dispatches a new connection to another thread. This is only ever called
  * from the main thread, either during initialization (for UDP) or because
  * of an incoming connection.
  */
-void dispatch_conn_new(int sfd, EN_CONN_STAT init_state, int event_flags,
-                       int read_buffer_size) 
+void THREAD_DispatchConnNew(sint32 sfd, EN_CONN_STAT init_state, sint32 event_flags,
+                       sint32 read_buffer_size) 
 {
     CQ_ITEM *item = cqi_new();
     char buf[1];
@@ -376,11 +397,11 @@ void dispatch_conn_new(int sfd, EN_CONN_STAT init_state, int event_flags,
 	{
         close(sfd);
         /* given that malloc failed this may also fail, but let's try */
-        LOGFUNC(Err, False, "Failed to allocate memory for connection object\n");
+        LOG_FUNC(Err, False, "Failed to allocate memory for connection object\n");
         return ;
     }
 
-    int tid = (last_thread + 1) % gstSettings.s32ThreadNum;
+    sint32 tid = (last_thread + 1) % gstSettings.s32ThreadNum;
 
     ST_LIBEVENT_THREAD *thread = pstThreads + tid;
 
@@ -392,11 +413,11 @@ void dispatch_conn_new(int sfd, EN_CONN_STAT init_state, int event_flags,
     item->read_buffer_size = read_buffer_size;
 
     cq_push(thread->new_conn_queue, item);
-	LOGFUNC(Debug, False, "push to thread %ld\n", thread->thread_id);
+	LOG_FUNC(Debug, False, "push to thread %lu\n", thread->threadId);
     buf[0] = 'c';
     if (write(thread->s32NotifySendFd, buf, 1) != 1) 
 	{
-        perror("Writing to thread notify pipe");
+        LOG_FUNC(Err, False, "Writing to thread notify pipe");
     }
 }
 
