@@ -706,69 +706,14 @@ static EN_TRYREAD_RET EVENT_TryReadNetwork(ST_CONN_INFO *c)
 /*
  * if we have a complete line in the buffer, process it.
  */
-static sint32 try_read_command(ST_CONN_INFO *c) 
+static sint32 EVENT_TryReadCommand(ST_CONN_INFO *c) 
 {
     assert(c != NULL);
     assert(c->rcurr <= (c->rbuf + c->rsize));
     assert(c->rbytes > 0);
 
-    if (c->protocol == negotiating_prot || c->transport == udp_transport)  {
-        if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
-            c->protocol = binary_prot;
-        } else {
-            c->protocol = ascii_prot;
-        }
-
-        if (settings.verbose > 1) {
-            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
-                    prot_text(c->protocol));
-        }
-    }
-
-   	{
-        char *el, *cont;
-
-        if (c->rbytes == 0)
-            return 0;
-
-        el = memchr(c->rcurr, '\n', c->rbytes);
-        if (!el) {
-            if (c->rbytes > 1024) {
-                /*
-                 * We didn't have a '\n' in the first k. This _has_ to be a
-                 * large multiget, if not we should just nuke the connection.
-                 */
-                char *ptr = c->rcurr;
-                while (*ptr == ' ') { /* ignore leading whitespaces */
-                    ++ptr;
-                }
-
-                if (ptr - c->rcurr > 100 ||
-                    (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5))) {
-
-                    conn_set_state(c, conn_closing);
-                    return 1;
-                }
-            }
-
-            return 0;
-        }
-        cont = el + 1;
-        if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
-            el--;
-        }
-        *el = '\0';
-
-        assert(cont <= (c->rcurr + c->rbytes));
-
-        c->last_cmd_time = current_time;
-        process_command(c, c->rcurr);
-
-        c->rbytes -= (cont - c->rcurr);
-        c->rcurr = cont;
-
-        assert(c->rcurr <= (c->rbuf + c->rsize));
-    }
+    /*parse a cmd*/
+   	
 
     return 1;
 }
@@ -899,9 +844,7 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
            		break; 
 			case enConnParseCmd:
 				LOG_FUNC(Debug, False, "recv msg = %s\n", c->rbuf);
-				
-				c->rcurr = c->rbuf;
-				c->rbytes = 0;
+				EVENT_TryReadCommand(c);
 				CONN_SetState(c, enConnWaiting);
 				break;
 			case enConnWrite:
