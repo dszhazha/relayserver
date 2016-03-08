@@ -36,6 +36,16 @@
 #define IOV_LIST_HIGHWAT 600
 #define MSG_LIST_HIGHWAT 100
 
+/*protocal head and tail byte defined*/
+//#define PROTOCAL_HEAD_BYTE	0xFAF5
+//#define PROTOCAL_TAIL_BYTE	0xFAF6
+#define PROTOCAL_HEAD_BYTE	0x3030
+#define PROTOCAL_TAIL_BYTE	0x3131
+
+#define COMMAND_START	0x21
+
+#define PROTOCAL_HERD_HEAD	8
+
 /**
  * Possible states of a connection.
  */
@@ -75,6 +85,55 @@ typedef struct libeventThread
   
 } ST_LIBEVENT_THREAD;
 
+/*command type*/
+typedef enum commandType
+{
+	enDevLoginCmd = 0x21,   /*device login first*/
+	enDevInfoCmd,			/*upload device message*/
+	enStreamStart,			/*device start transmit data*/
+	enStreamEnd				/*device stop transmit data*/
+}EN_CMD_TYPE;
+
+typedef enum attributeType
+{
+	enCmdRes = 0x01,
+	enErrReason = 0x02,
+	enDevName = 0x10,
+	enDevPasswd = 0x11,
+	enEncType = 0x12,
+	enVoPix = 0x13,
+	enVobite = 0x14,
+	enVoFps = 0x15,
+	enVoBrc = 0x16,
+	enAoType = 0x17
+}EN_ATTR_TYPE;
+
+typedef struct commandHeader
+{
+	uint8	u8CmdType;   /*command type */
+	uint16	u16SerilNum;	/*serial number 0_65536*/
+	uint8	u8CmdRQ;		/*request or responce*/
+	uint16  u16CmdLen;		/*command length*/
+}ST_CMD_HDR;
+
+typedef enum connectType
+{
+	enConnDevice,   /*ipc*/
+	enConnPlayer	/*video player*/
+}EN_CONN_TYPE;
+
+typedef struct deviceInformation
+{
+	sint8 devName[64];
+	sint8 devPasswd[64];
+	
+}ST_DEV_INFO;
+
+typedef struct playerInformation
+{
+	
+}ST_PLAYER_INFO;
+
 /**
  * The structure representing a connection into replay server.
  */
@@ -83,19 +142,31 @@ typedef struct connectInformation
 	sint32	s32Sockfd;
 	struct event evConnEvent;
 	sint16  s16Evflags;
-	
+
+	EN_CONN_TYPE	enConnType;
+
+	union{
+		ST_DEV_INFO stDevInfo;
+		ST_PLAYER_INFO stPlayerInfo;
+	};
 	rel_time_t	lastCmdTime;
 
 	EN_CONN_STAT	enConnStat;
 	 /** which state to go into after finishing current write */
     EN_CONN_STAT  write_and_go;
 
+	bool	bFindEot;
+	uint16	u16Sync;
+	sint8   *rpos;
+	sint8   *rsot;		/*cmd head byte*/
+	sint8   *reot;		/*cmd end byte*/
+
 	/*read buffer struct*/
 	sint8   *rbuf;   /** buffer to read commands into */
     sint8   *rcurr;  /** but if we parsed some already, this is where we stopped */
-    sint32    rsize;   /** total allocated size of rbuf */
-    sint32    rbytes;  /** how much data, starting from rcur, do we have unparsed */
-
+    sint32   rsize;   /** total allocated size of rbuf */
+    sint32   rbytes;  /** how much data, starting from rcur, do we have unparsed */
+					
 	/*write buffer struct*/
     sint8   *wbuf;
     sint8   *wcurr;

@@ -702,6 +702,103 @@ static EN_TRYREAD_RET EVENT_TryReadNetwork(ST_CONN_INFO *c)
     }
     return gotdata;
 }
+static const sint8 *ENENT_CmdTypeText(uint8 u8CmdType)
+{
+	const sint8* const cmdnames[] = { "login begin",
+                                       "device message",
+                                       "heart beat",
+                                       "stream start",
+                                       "stream stop"};
+
+	return cmdnames[u8CmdType-COMMAND_START];
+}
+
+static const sint8 *ENENT_ResTypeText(uint8 u8ResType)
+{
+	const sint8* const resType[] = { "request",
+                                       "responce"};
+
+	return resType[u8ResType];
+}
+
+static sint32 EVENT_GetAttribute(ST_CONN_INFO *c, EN_ATTR_TYPE enAttrType, sint8 *attr, uint16 u16AttrLen)
+{
+	sint8 	pos = attr;
+	uint16  leftLen = u16AttrLen;
+	uint8 	curAttrType;
+	uint16 	curAttrLen;
+	
+	do{
+		curAttrType = pos[0];
+		curAttrLen = (uint16)&pos[1];
+		if(curAttrLen > leftLen-3)
+			return -1; /*message error*/
+		if(curAttrType == enAttrType)
+		{
+			switch(enAttrType)
+			{
+				case enDevName:
+					strncpy(c->stDevInfo.devName, pos+2, curAttrLen);
+				case enDevPasswd:
+					strncpy(c->stDevInfo.devPasswd, pos+2, curAttrLen);
+			}
+			return 1;
+		}
+			
+		pos += (curAttrLen+3);
+		leftLen -= (curAttrLen+3)
+	}while(leftLen > 0);
+	return 0;
+}
+static sint32 EVENT_ProcessLoginCommand(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen)
+{
+	assert(c != NULL);
+
+	sint32 s32Ret;
+	s32Ret = EVENT_GetAttribute(c, enDevName, attr, u16AttrLen);
+	if(s32Ret != 1)
+	{
+		LOG_FUNC(Err, False, "get devname err\n");
+		return 0;
+	}
+
+	s32Ret = EVENT_GetAttribute(c, enDevPasswd, attr, u16AttrLen);
+	if(s32Ret != 1)
+	{
+		LOG_FUNC(Err, False, "get devpasswd err\n");
+		return 0;
+	}
+
+	return 1;
+}
+
+static void EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
+{
+	assert(c != NULL);
+
+	ST_CMD_HDR *pstCmdHdr = (ST_CMD_HDR *)(command+2);
+	LOG_FUNC(Debug, False, 	"cmd type: %s\n"
+							"serial: %d\n"
+							"res type: %s\n"
+							"cmd len: %d\n",
+							ENENT_CmdTypeText(pstCmdHdr->u8CmdType),
+							pstCmdHdr->u16SerilNum,
+							ENENT_ResTypeText(pstCmdHdr->u8CmdRQ),
+							pstCmdHdr->u16CmdLen);
+	sint8 *attr = command
+	
+	switch(pstCmdHdr->u8CmdType)
+	{
+		case enDevLoginCmd:
+			return EVENT_ProcessLoginCommand(c, command+PROTOCAL_HERD_HEAD);
+		case enDevInfoCmd:
+		case enStreamStart:
+		case enStreamEnd:
+		default:
+			LOG_FUNC(Err, False, "Unknow message\n");
+			break;
+	}
+}
 
 /*
  * if we have a complete line in the buffer, process it.
@@ -713,11 +810,44 @@ static sint32 EVENT_TryReadCommand(ST_CONN_INFO *c)
     assert(c->rbytes > 0);
 
     /*parse a cmd*/
-   	
+	c->rpos = c->rcurr;
+		
+ 	do{
+		if(c->bFindEot == true)
+		{
+			c->u16Sync <<= 8;
+			c->u16Sync |= *c->rpos;
+			if(c->u16Sync == PROTOCAL_TAIL_BYTE)
+			{
+				c->u16Sync = 0;
+				c->reot = c->rpos;
+				/*process a cmd*/
+				LOG_FUNC(Debug, False, "recv msg = %s\n", c->rcurr);
+				EVENT_ProcessCommand(c, c->rcurr);
+				c->rbytes -= (c->rpos+1-c->rcurr);
+				c->rcurr = (c->rpos+1);
+				return 0;
+			}
+		}
+		else
+		{
+			c->u16Sync <<= 8;
+			c->u16Sync |= *c->rpos;
+			if(c->u16Sync == PROTOCAL_HEAD_BYTE)
+			{
+				c->u16Sync = 0;
+				c->rsot = c->rpos-1;
+				c->rbytes -= (c->rpos-1-c->rcurr);
+				c->rcurr = (c->rpos-1);
+				c->bFindEot = true;
+			}
+		}
+		c->rpos++;
+	}while(c->rpos < c->rcurr+c->rbytes);
 
-    return 1;
+	/*we need more data*/
+    return 0;
 }
-
 
 static void EVENT_DriveMachine(ST_CONN_INFO *c)
 {
@@ -843,9 +973,8 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
             	}
            		break; 
 			case enConnParseCmd:
-				LOG_FUNC(Debug, False, "recv msg = %s\n", c->rbuf);
-				EVENT_TryReadCommand(c);
-				CONN_SetState(c, enConnWaiting);
+				if(EVENT_TryReadCommand(c) == 0)
+					CONN_SetState(c, enConnWaiting);
 				break;
 			case enConnWrite:
 			case enConnClosing:
