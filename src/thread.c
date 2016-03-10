@@ -28,7 +28,8 @@
 typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
     sint32               	sfd;
-    EN_CONN_STAT  		init_state;
+    EN_CONN_STAT  			init_state;
+	EN_CONN_TYPE 			enConnType;
     sint32               	event_flags;
     sint32               	read_buffer_size;
     CQ_ITEM          	*next;
@@ -74,7 +75,7 @@ static ST_LIBEVENT_THREAD *pstThreads;
 extern ST_RELAY_STATUS		gstStats;
 
 extern ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
-                const sint32 event_flags,
+                const sint32 event_flags, EN_CONN_TYPE enConnType,
                 const sint32 read_buffer_size,
                 struct event_base *base); 
 
@@ -299,7 +300,7 @@ static void THREAD_LibeventProcess(sint32 fd, sint16 which, void *arg)
 		    if (NULL != item) 
 			{
 		        ST_CONN_INFO *c = CONN_NodeNew(item->sfd, item->init_state, item->event_flags,
-		                           item->read_buffer_size, me->base);
+		                           item->enConnType, item->read_buffer_size, me->base);
 		        if (c == NULL) 
 				{  
 					if (gstSettings.bVerbose) 
@@ -388,8 +389,8 @@ void THERAD_RelaysrvInit(sint32 nthreads, struct event_base *main_base)
  * from the main thread, either during initialization (for UDP) or because
  * of an incoming connection.
  */
-void THREAD_DispatchConnNew(sint32 sfd, EN_CONN_STAT init_state, sint32 event_flags,
-                       sint32 read_buffer_size) 
+void THREAD_DispatchConnNew(sint32 sfd, EN_CONN_TYPE enConnType, EN_CONN_STAT init_state, 
+		sint32 event_flags, sint32 read_buffer_size) 
 {
     CQ_ITEM *item = cqi_new();
     char buf[1];
@@ -409,6 +410,7 @@ void THREAD_DispatchConnNew(sint32 sfd, EN_CONN_STAT init_state, sint32 event_fl
 
     item->sfd = sfd;
     item->init_state = init_state;
+	item->enConnType = enConnType;
     item->event_flags = event_flags;
     item->read_buffer_size = read_buffer_size;
 
