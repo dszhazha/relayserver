@@ -6,11 +6,13 @@
  *
  *  	Copyright 2016 Danga Interactive, Inc.  All rights reserved.
  *		File Name 	: 	server.h
- *  	Authors		:	Vict Ding <dszhazha@163.com>
+ *  		Authors		:	Vict Ding <dszhazha@163.com>
  * 		Date   		: 	2016/2/29     
  *      
  */
+
 #include "type.h"
+#include "log.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -23,7 +25,7 @@
 
 #define UPDATE_INTERVAL 	0
 
-#define DATA_BUFFER_SIZE 2048
+#define DATA_BUFFER_SIZE 	20000//2048
 
 #define IOV_MAX			1024
 #define MAX_PAYLOAD_SIZE 1400
@@ -35,15 +37,16 @@
 #define MSG_LIST_INITIAL 10
 
 /** High water marks for buffer shrinking */
-#define READ_BUFFER_HIGHWAT 8192
+#define READ_BUFFER_HIGHWAT 40000//8192
 #define IOV_LIST_HIGHWAT 600
 #define MSG_LIST_HIGHWAT 100
 
 /*protocal head and tail byte defined*/
 #define PROTOCAL_HEAD_BYTE	0xFAF5
 #define PROTOCAL_TAIL_BYTE	0xFAF6
-//#define PROTOCAL_HEAD_BYTE	0x3030
-//#define PROTOCAL_TAIL_BYTE	0x3131
+
+/*ringbuffer index*/
+#define 	MAX_INDEX			65000
 
 #define COMMAND_START	0x21
 
@@ -63,6 +66,18 @@
 #define CMD_SET_LEN(pHDR, val)  	((pHDR)->u16CmdLen = val)
 #define CMD_SET_TAIL(BYTE, val)  	(BYTE = val)
 
+typedef enum errorCode
+{
+	enErrLessAttr = 0x01,
+	enErrLoginFirst,
+	enErrStartStreamFirst,
+	enErrNameNotmatch,
+}EN_ERR_CODE;
+
+typedef struct errorCodeMap{
+	EN_ERR_CODE s32ErrCode;
+	sint8   *pDescribe;
+}ST_ERRCODE_MAP;
 
 
 /**
@@ -109,28 +124,33 @@ typedef enum commandType
 {
 	enDevLoginCmd = 0x21,   /*device login first*/
 	enDevInfoCmd,			/*upload device message*/
+	enSendHeartBeat,		/*upload device heartBeat*/
 	enStreamStart,			/*device start transmit data*/
-	enStreamEnd				/*device stop transmit data*/
+	enStreamEnd,			/*device stop transmit data*/
+	enStreamSenddata			/*video and audio data*/
 }EN_CMD_TYPE;
 
 typedef enum attributeType
 {
-	enCmdRes = 0x01,
-	enErrReason = 0x02,
-	enDevName = 0x10,
-	enDevPasswd = 0x11,
-	enEncType = 0x12,
-	enVoReso = 0x13,
-	enVobit = 0x14,
-	enVoFps = 0x15,
-	enVoBrc = 0x16,  //Bit Rate Control
-	enAoType = 0x17
+	enCmdRes = 0x01,  /*message result*/
+	enErrReason = 0x02,	/*message error code*/
+	enDevName = 0x10,	/*device name*/
+	enDevPasswd = 0x11,	/*device password*/
+	enEncType = 0x12,	/*video encodec type*/
+	//enVoReso = 0x13,	/*video resolution*/
+	enVoWidth = 0x13,	/*video width*/
+	enVoHeigth, 		/*video heigth*/
+	enVobit,		/*video bit rate*/
+	enVoFps,		/*video frame per second*/
+	enVoBrc ,  	/*Bit Rate Control*/
+	enAoType ,	/*audio encodec type*/
+	enStreamData
 }EN_ATTR_TYPE;
 
 typedef enum commandRQ
 {
-	enCmdTypeReq,
-	enCmdTypeRes
+	enCmdTypeReq,		/*request*/
+	enCmdTypeRes		/*responce*/
 }EN_CMD_RQ;
 
 #pragma pack(1)
@@ -155,10 +175,11 @@ typedef enum connectType
 
 typedef enum deviceStatus
 {
-	enDevInit,
+	enDevInit,		/*login*/
 	enDevLogin,
 	enDevMessage,
-	enDevHeartBeat
+	enDevHeartBeat,
+	enDevTransfStream
 }EN_DEV_STAT;
 
 typedef enum videoEncodeType
@@ -190,22 +211,19 @@ typedef enum audioEncodeType
 
 typedef struct deviceInformation
 {
-	sint8 devName[64];
-	sint8 devPasswd[64];
+	sint8 			devName[NAME_LEN];
+	sint8 			devPasswd[NAME_LEN];
 	EN_VENC_TYPE 	enVencType;
-	EN_VIDEO_RESO	enVreso;
-	uint32	u32VideoBit;
-	uint32 	u32VideoFps;
+	//EN_VIDEO_RESO	enVreso;
+	uint32			u32VideoWidth;
+	uint32			u32VideoHeigth;
+	uint32			u32VideoBit;
+	uint32 			u32VideoFps;
 	EN_VIDEO_BRC	enVbrc;
 	EN_AENC_TYPE	enAencType;
 	
-	EN_DEV_STAT enDevStat;
+	EN_DEV_STAT 	enDevStat;
 }ST_DEV_INFO;
-
-typedef struct playerInformation
-{
-	
-}ST_PLAYER_INFO;
 
 typedef enum transmitResult 
 {
@@ -215,6 +233,50 @@ typedef enum transmitResult
     TRANSMIT_HARD_ERROR  /** Can't write (c->state is set to conn_closing) */
 }EN_TRENSMIT_RES;
 
+typedef struct FrameIndex
+{
+	sint32			bIsLock;			/* 共享锁 */
+	sint32 			frameType;		/* 当前包的类型 */
+	uint32			len;			/* 当前包的长度 */
+	uint32			offset;			/* 当前包数据的起始地址 */
+	time_t			wTime; 			/* 写入时间 */
+}ST_FRAME_INDEX;
+
+typedef struct RingBuffer
+{
+	sint32			bIsFull;				/* 满标志 */
+	uint32 			u32MaxLen;				/* 最大容量 */
+	uint32			u32LeftLen;			/* 剩余容量 */
+	uint32			u32HeadIndex;			/* 指向ringBuf头的索引 */
+	uint32 			u32CurIndex; 			/* 当前操作的索引 */
+	uint32			u32OldIndex; 			/* 最旧的索引 */
+	uint32			u32CurPos;				/* 当前位置 */
+	uint32			u32CurPlayIndex;		/*接下来需要播放的索引*/
+	sint8			*strBuf;			/* 数据指针 */
+
+	pthread_mutex_t	muxWriteLock;
+	ST_FRAME_INDEX	stIndex[MAX_INDEX];	/* 索引 */	
+}ST_RING_BUF;
+
+typedef struct rtspSession
+{
+	sint8	userAgent[128];
+	
+	sint32	clientType;
+	sint32	s32LastSendReq;
+	uint32	u32LastSendSeq;	
+	uint32	u32LastRecvSeq;
+
+	ST_CONN_INFO *pstDevSession;
+	
+}ST_RTSP_SESSION;
+
+typedef struct
+{
+	sint32 	multicast_port;
+	sint32 	multicast_ttl;
+	sint8 	multicast_ip[32];
+}ST_MULTICAST_PARA;
 
 /**
  * The structure representing a connection into replay server.
@@ -226,13 +288,7 @@ typedef struct connectInformation
 	sint16  s16Evflags;
 
 	EN_CONN_TYPE	enConnType;
-
-	union{
-		ST_DEV_INFO stDevInfo;
-		ST_PLAYER_INFO stPlayerInfo;
-	};
 	rel_time_t	lastCmdTime;
-
 	EN_CONN_STAT	enConnStat;
 	 /** which state to go into after finishing current write */
     EN_CONN_STAT  write_and_go;
@@ -270,6 +326,10 @@ typedef struct connectInformation
     socklen_t requestAddrSize;
 
 	sint16 	  cmd; /* current command being processed */
+
+	ST_RING_BUF 	*pstRingBuf; 
+	ST_DEV_INFO 	*pstDevInfo;
+	ST_RTSP_SESSION *pRtspSess;
 
 	struct connectInformation		*pstConnNext;
 	ST_LIBEVENT_THREAD	*pstThread;

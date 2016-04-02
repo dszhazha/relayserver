@@ -10,8 +10,7 @@
  * 		Date   		: 	2016/2/29     
  *      
  */
-#include "type.h"
-#include "log.h"
+#include "server.h"
 
 #include <stdio.h>
 #include <stdlib.h>

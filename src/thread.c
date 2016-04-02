@@ -21,7 +21,6 @@
 #include <pthread.h>
 
 #include "server.h"
-#include "log.h"
 
 #define ITEMS_PER_ALLOC 64
 

@@ -6,22 +6,19 @@
  *
  *  	Copyright 2016 Danga Interactive, Inc.  All rights reserved.
  *		File Name 	: 	server.c
- *  	Authors		:	Vict Ding <dszhazha@163.com>
+ *  		Authors		:	Vict Ding <dszhazha@163.com>
  * 		Date   		: 	2016/2/29     
  *      
  */
-#include "server.h"
-#include "log.h"
-
-#include <sys/stat.h>
+//#include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/un.h>
+//#include <sys/un.h>
 #include <signal.h>
-#include <sys/param.h>
+//#include <sys/param.h>
 #include <sys/resource.h>
-#include <sys/uio.h>
+//#include <sys/uio.h>
 #include <ctype.h>
-#include <stdarg.h>
+//#include <stdarg.h>
 
 #include <pwd.h>
 #include <sys/mman.h>
@@ -32,15 +29,23 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
+//#include <time.h>
 #include <assert.h>
 #include <limits.h>
-#include <sysexits.h>
-#include <stddef.h>
+//#include <sysexits.h>
+//#include <stddef.h>
+
+#include "server.h"
 
 /*global value declaration*/
 ST_RELAY_SETTINGS 	gstSettings;
 ST_RELAY_STATUS		gstStats;
+
+ST_ERRCODE_MAP gstErrcodeMap[] = 
+{
+	{enErrLessAttr, 	"Attribute missing"},
+	{enErrLoginFirst,	"Login first"}
+};
 
 
 ST_CONN_INFO **ppstConnList;
@@ -76,6 +81,12 @@ extern void THREAD_DispatchConnNew(sint32 sfd, EN_CONN_TYPE enConnType, EN_CONN_
 		sint32 event_flags, sint32 read_buffer_size);
 extern void STATS_LOCK(void);
 extern void STATS_UNLOCK(void); 
+
+extern void RingBuffer_Init(ST_RING_BUF *ab);
+extern void RingBuffer_Write(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTime);
+
+extern sint32 RTSP_SessionProcess(ST_CONN_INFO *c);
+
 
 static void SETTINGS_Init(void)
 {
@@ -182,7 +193,7 @@ static const sint8 *CONN_StateText(EN_CONN_STAT enState)
  * processing that needs to happen on certain state transitions can
  * happen here.
  */
-static void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState) 
+void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState) 
 {
     assert(pstConnInfo != NULL);
     assert(enState >= enConnListening && enState < enConnMaxState);
@@ -200,18 +211,35 @@ static void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState)
     }
 }
 
-static void CONN_SocketClose(ST_CONN_INFO *pstConnInfo) 
+static void CONN_SocketClose(ST_CONN_INFO *c) 
 {
-    assert(pstConnInfo != NULL);
+    assert(c != NULL);
 
     /* delete the event, the socket and the conn */
-    event_del(&pstConnInfo->evConnEvent);
+    event_del(&c->evConnEvent);
 
-    if (gstSettings.bVerbose)
-        LOG_FUNC(Err, False, "<%d connection closed.\n", pstConnInfo->s32Sockfd);
+    LOG_FUNC(Err, False, "<%d connection closed.\n", c->s32Sockfd);
 
-    CONN_SetState(pstConnInfo, enConnClosed);
-    close(pstConnInfo->s32Sockfd);
+    CONN_SetState(c, enConnClosed);
+    close(c->s32Sockfd);
+
+	if(c->pRtspSess != NULL)
+	{
+		free(c->pRtspSess);
+		c->pRtspSess = NULL;
+	}
+		
+	if(c->pstDevInfo != NULL)
+	{
+		free(c->pstDevInfo);
+		c->pstDevInfo = NULL;
+	}
+		
+	if(c->pstRingBuf != NULL)
+	{
+		free(c->pstRingBuf);
+		c->pstRingBuf = NULL;
+	}
 
 	STATS_LOCK();
     gstStats.u32CurrConns--;
@@ -223,23 +251,29 @@ static void CONN_SocketClose(ST_CONN_INFO *pstConnInfo)
 /*
  * Frees a connection.
  */
-void CONN_NodeFree(ST_CONN_INFO *pstConnInfo) 
+void CONN_NodeFree(ST_CONN_INFO *c) 
 {
-    if (pstConnInfo) 
+    if (c) 
 	{
-        assert(pstConnInfo != NULL);
-        assert(pstConnInfo->s32Sockfd >= 0 && pstConnInfo->s32Sockfd < gs32MaxFds);
+        assert(c != NULL);
+        assert(c->s32Sockfd >= 0 && c->s32Sockfd < gs32MaxFds);
 
-        ppstConnList[pstConnInfo->s32Sockfd] = NULL;
-        if (pstConnInfo->msglist)
-            free(pstConnInfo->msglist);
-        if (pstConnInfo->rbuf)
-            free(pstConnInfo->rbuf);
-        if (pstConnInfo->wbuf)
-            free(pstConnInfo->wbuf);
-        if (pstConnInfo->iov)
-            free(pstConnInfo->iov);
-        free(pstConnInfo);
+        ppstConnList[c->s32Sockfd] = NULL;
+        if (c->msglist)
+            free(c->msglist);
+        if (c->rbuf)
+            free(c->rbuf);
+        if (c->wbuf)
+            free(c->wbuf);
+        if (c->iov)
+            free(c->iov);
+		if(c->pRtspSess != NULL)
+			free(c->pRtspSess);
+		if(c->pstDevInfo != NULL)
+			free(c->pstDevInfo);
+		if(c->pstRingBuf != NULL)
+			free(c->pstRingBuf);
+        free(c);
     }
 }
 ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
@@ -313,6 +347,29 @@ ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
     c->msgcurr = 0;
     c->msgused = 0;
 
+	c->pstRingBuf = NULL;
+	//c->pstDevInfo = NULL;
+	//c->pRtspSess = NULL;
+	
+	if(enConnType == enConnDevice)
+	{
+		c->pstDevInfo = (ST_DEV_INFO *)calloc(1, sizeof(ST_DEV_INFO));
+		if (c->pstDevInfo == NULL) 
+		{
+            LOG_FUNC(Err, True, "Failed to allocate device session\n");
+            return NULL;
+        }
+	}		
+	else if(enConnType == enConnPlayer)
+	{
+		c->pRtspSess = (ST_RTSP_SESSION *)calloc(1, sizeof(ST_RTSP_SESSION));
+		if (c->pRtspSess == NULL) 
+		{
+            LOG_FUNC(Err, True, "Failed to allocate rtsp session\n");
+            return NULL;
+        }
+	}
+			
     event_set(&c->evConnEvent, sfd, event_flags, EVENT_ConnHandler, (void *)c);
     event_base_set(base, &c->evConnEvent);
     c->s16Evflags = event_flags;
@@ -461,6 +518,343 @@ static int CONN_ServerSocket(const char *interface, sint32 port)
     return success == 0;
 }
 
+/*
+ * Shrinks a connection's buffers if they're too big.  This prevents
+ * periodic large "get" requests from permanently chewing lots of server
+ * memory.
+ *
+ * This should only be called in between requests since it can wipe output
+ * buffers!
+ */
+static void RBUFFER_Shrink(ST_CONN_INFO *c) 
+{
+    assert(c != NULL);
+
+    if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE)
+	{
+        char *newbuf;
+
+        if (c->rcurr != c->rbuf)
+            memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
+
+        newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
+
+        if (newbuf) 
+		{
+            c->rbuf = newbuf;
+            c->rsize = DATA_BUFFER_SIZE;
+        }
+        /* TODO check other branch... */
+        c->rcurr = c->rbuf;
+    }
+
+    /* TODO check error condition? */
+    if (c->msgsize > MSG_LIST_HIGHWAT) 
+	{
+        struct msghdr *newbuf = (struct msghdr *) realloc((void *)c->msglist, MSG_LIST_INITIAL * sizeof(c->msglist[0]));
+        if (newbuf) 
+		{
+            c->msglist = newbuf;
+            c->msgsize = MSG_LIST_INITIAL;
+        }
+    /* TODO check error condition? */
+    }
+
+    if (c->iovsize > IOV_LIST_HIGHWAT)
+	{
+        struct iovec *newbuf = (struct iovec *) realloc((void *)c->iov, IOV_LIST_INITIAL * sizeof(c->iov[0]));
+        if (newbuf) 
+		{
+            c->iov = newbuf;
+            c->iovsize = IOV_LIST_INITIAL;
+        }
+    /* TODO check return value */
+    }
+}
+
+/*
+ * read from network as much as we can, handle buffer overflow and connection
+ * close.
+ * before reading, move the remaining incomplete fragment of a command
+ * (if any) to the beginning of the buffer.
+ *
+ * To protect us from someone flooding a connection with bogus data causing
+ * the connection to eat up all available memory, break out and start looking
+ * at the data I've got after a number of reallocs...
+ *
+ * @return enum try_read_result
+ */
+static EN_TRYREAD_RET RBUFFER_TryReadNetwork(ST_CONN_INFO *c) 
+{
+    EN_TRYREAD_RET gotdata = READ_NO_DATA_RECEIVED;
+    int res;
+    int num_allocs = 0;
+    assert(c != NULL);
+
+    if (c->rcurr != c->rbuf) 
+	{
+        if (c->rbytes != 0) /* otherwise there's nothing to copy */
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+        c->rcurr = c->rbuf;
+    }
+
+    while (1) 
+	{
+        if (c->rbytes >= c->rsize) 
+		{
+            if (num_allocs == 4) 
+			{
+                return gotdata;
+            }
+            ++num_allocs;
+            char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
+            if (!new_rbuf) 
+			{ 
+                if (gstSettings.bVerbose > 0) 
+				{
+                    LOG_FUNC(Err, False, "Couldn't realloc input buffer\n");
+                }
+                c->rbytes = 0; /* ignore what we read */
+                //out_of_memory(c, "SERVER_ERROR out of memory reading request");
+                c->write_and_go = enConnClosing;
+                return READ_MEMORY_ERROR;
+            }
+            c->rcurr = c->rbuf = new_rbuf;
+            c->rsize *= 2;
+        }
+
+        int avail = c->rsize - c->rbytes;
+        res = read(c->s32Sockfd, c->rbuf + c->rbytes, avail);
+        if (res > 0) 
+		{
+            gotdata = READ_DATA_RECEIVED;
+            c->rbytes += res;
+            if (res == avail) 
+			{
+                continue;
+            } 
+			else 
+           	{
+                break;
+            }
+        }
+        if (res == 0) 
+		{
+            return READ_ERROR;
+        }
+        if (res == -1) 
+		{
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+                break;
+            }
+            return READ_ERROR;
+        }
+    }
+    return gotdata;
+}
+
+/*
+ * Adds a message header to a connection.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ */
+int WBUFFER_AddMsghdr(ST_CONN_INFO *c)
+{
+    struct msghdr *msg;
+
+    assert(c != NULL);
+
+    if (c->msgsize == c->msgused) 
+	{
+        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
+        if (! msg) 
+		{
+          	LOG_FUNC(Err, True, "realloc error");
+            return -1;
+        }
+        c->msglist = msg;
+        c->msgsize *= 2;
+    }
+
+    msg = c->msglist + c->msgused;
+
+    /* this wipes msg_iovlen, msg_control, msg_controllen, and
+       msg_flags, the last 3 of which aren't defined on solaris: */
+    memset(msg, 0x0, sizeof(struct msghdr));
+
+    msg->msg_iov = &c->iov[c->iovused];
+
+    c->msgbytes = 0;
+    c->msgused++;
+
+    return 0;
+}
+
+/*
+ * Ensures that there is room for another struct iovec in a connection's
+ * iov list.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ */
+static int WBUFFER_EnsureIovSpace(ST_CONN_INFO *c) 
+{
+    assert(c != NULL);
+
+    if (c->iovused >= c->iovsize) 
+	{
+        int i, iovnum;
+        struct iovec *new_iov = (struct iovec *)realloc(c->iov,
+                                (c->iovsize * 2) * sizeof(struct iovec));
+        if (! new_iov) 
+		{
+            LOG_FUNC(Err, True, "realloc error");
+            return -1;
+        }
+        c->iov = new_iov;
+        c->iovsize *= 2;
+
+        /* Point all the msghdr structures at the new list. */
+        for (i = 0, iovnum = 0; i < c->msgused; i++) 
+		{
+            c->msglist[i].msg_iov = &c->iov[iovnum];
+            iovnum += c->msglist[i].msg_iovlen;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Adds data to the list of pending data that will be written out to a
+ * connection.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ */
+static int WBUFFER_AddIov(ST_CONN_INFO *c, const void *buf, sint32 len) 
+{
+    struct msghdr *m;
+    int leftover;
+
+    assert(c != NULL);
+
+    do {
+        m = &c->msglist[c->msgused-1];
+
+        /* We may need to start a new msghdr if this one is full. */
+        if (m->msg_iovlen == IOV_MAX || (c->msgbytes >= MAX_PAYLOAD_SIZE)) 
+		{
+            WBUFFER_AddMsghdr(c);
+            m = &c->msglist[c->msgused-1];
+        }
+
+        if (WBUFFER_EnsureIovSpace(c) != 0)
+            return -1;
+
+        /* If the fragment is too big to fit in the datagram, split it up */
+        if (len + c->msgbytes > MAX_PAYLOAD_SIZE) 
+		{
+            leftover = len + c->msgbytes - MAX_PAYLOAD_SIZE;
+            len -= leftover;
+        } 
+		else 
+		{
+            leftover = 0;
+        }
+
+        m = &c->msglist[c->msgused-1];
+        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+        m->msg_iov[m->msg_iovlen].iov_len = len;
+        c->msgbytes += len;
+        c->iovused++;
+        m->msg_iovlen++;
+		
+        buf = ((char *)buf) + len;
+        len = leftover;
+    } while (leftover > 0);
+
+    return 0;
+}
+
+static const sint8 *PARSE_CmdTypeText(uint8 u8CmdType)
+{
+	const sint8* const cmdnames[] = { "login begin",
+                                       "device message",
+                                       "heart beat",
+                                       "stream start",
+                                       "stream stop"};
+
+	return cmdnames[u8CmdType-COMMAND_START];
+}
+
+static const sint8 *PARSE_ResTypeText(uint8 u8ResType)
+{
+	const sint8* const resType[] = { "request",
+                                       "responce"};
+
+	return resType[u8ResType];
+}
+
+static sint32 PARSE_GetAttribute(void *destBuf, EN_ATTR_TYPE enAttrType, sint8 *attr, uint16 u16AttrLen)
+{
+	sint8 	*pos = attr;
+	uint16  leftLen = u16AttrLen;
+	uint8 	curAttrType;
+	uint16 	curAttrLen;
+	
+	do{
+		curAttrType = pos[0];
+		memcpy(&curAttrLen, &pos[1], 2);
+		if(curAttrLen > leftLen-3)
+			return FAIL; /*message error*/
+		if(curAttrType == enAttrType)
+		{
+			memcpy(destBuf, pos+3, curAttrLen);
+			return SUCCESS;
+		}
+			
+		pos += (curAttrLen+3);
+		leftLen -= (curAttrLen+3);
+	}while(leftLen > 0);
+	
+	return FAIL;
+}
+
+static sint32 PARSE_GetAttributeAddr(sint8 **destBuf, EN_ATTR_TYPE enAttrType, sint8 *attr, uint16 u16AttrLen)
+{
+	sint8 	*pos = attr;
+	uint16  leftLen = u16AttrLen;
+	uint8 	curAttrType;
+	uint16 	curAttrLen;
+	
+	do{
+		curAttrType = pos[0];
+		memcpy(&curAttrLen, &pos[1], 2);
+		if(curAttrLen > leftLen-3)
+			return FAIL; /*message error*/
+		if(curAttrType == enAttrType)
+		{
+			//memcpy(destBuf, pos+3, curAttrLen);
+			*destBuf = pos+3;
+			return curAttrLen;
+		}
+			
+		pos += (curAttrLen+3);
+		leftLen -= (curAttrLen+3);
+	}while(leftLen > 0);
+	
+	return FAIL;
+}
+
+static sint32 PARSE_SetAttribute(sint8 *buf, EN_ATTR_TYPE enAttrType, void *attr, uint16 u16AttrLen)
+{
+	buf[0] = enAttrType;
+	memcpy(&buf[1], &u16AttrLen, 2);
+	memcpy(&buf[3], attr, u16AttrLen);
+	
+	return u16AttrLen+3;
+}
+
 
 /**
  * Do basic sanity check of the runtime environment
@@ -543,65 +937,11 @@ static void EVENT_ClockHandler(const sint32 fd, const sint16 which, void *arg)
     }
 }
 
-/*
- * Shrinks a connection's buffers if they're too big.  This prevents
- * periodic large "get" requests from permanently chewing lots of server
- * memory.
- *
- * This should only be called in between requests since it can wipe output
- * buffers!
- */
-static void EVENT_BufferShrink(ST_CONN_INFO *c) 
-{
-    assert(c != NULL);
-
-    if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE)
-	{
-        char *newbuf;
-
-        if (c->rcurr != c->rbuf)
-            memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
-
-        newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
-
-        if (newbuf) 
-		{
-            c->rbuf = newbuf;
-            c->rsize = DATA_BUFFER_SIZE;
-        }
-        /* TODO check other branch... */
-        c->rcurr = c->rbuf;
-    }
-
-    /* TODO check error condition? */
-    if (c->msgsize > MSG_LIST_HIGHWAT) 
-	{
-        struct msghdr *newbuf = (struct msghdr *) realloc((void *)c->msglist, MSG_LIST_INITIAL * sizeof(c->msglist[0]));
-        if (newbuf) 
-		{
-            c->msglist = newbuf;
-            c->msgsize = MSG_LIST_INITIAL;
-        }
-    /* TODO check error condition? */
-    }
-
-    if (c->iovsize > IOV_LIST_HIGHWAT)
-	{
-        struct iovec *newbuf = (struct iovec *) realloc((void *)c->iov, IOV_LIST_INITIAL * sizeof(c->iov[0]));
-        if (newbuf) 
-		{
-            c->iov = newbuf;
-            c->iovsize = IOV_LIST_INITIAL;
-        }
-    /* TODO check return value */
-    }
-}
-
 static void EVENT_ResetCmdHandler(ST_CONN_INFO *c) 
 {
     c->cmd = -1;
     
-    EVENT_BufferShrink(c);
+    RBUFFER_Shrink(c);
     if (c->rbytes > 0)
 	{
         CONN_SetState(c, enConnParseCmd);
@@ -629,169 +969,7 @@ static bool EVENT_UpdateEvent(ST_CONN_INFO *c, const sint32 new_flags)
     return true;
 }
 
-/*
- * read from network as much as we can, handle buffer overflow and connection
- * close.
- * before reading, move the remaining incomplete fragment of a command
- * (if any) to the beginning of the buffer.
- *
- * To protect us from someone flooding a connection with bogus data causing
- * the connection to eat up all available memory, break out and start looking
- * at the data I've got after a number of reallocs...
- *
- * @return enum try_read_result
- */
-static EN_TRYREAD_RET EVENT_TryReadNetwork(ST_CONN_INFO *c) 
-{
-    EN_TRYREAD_RET gotdata = READ_NO_DATA_RECEIVED;
-    int res;
-    int num_allocs = 0;
-    assert(c != NULL);
-
-    if (c->rcurr != c->rbuf) 
-	{
-        if (c->rbytes != 0) /* otherwise there's nothing to copy */
-            memmove(c->rbuf, c->rcurr, c->rbytes);
-        c->rcurr = c->rbuf;
-    }
-
-    while (1) 
-	{
-        if (c->rbytes >= c->rsize) 
-		{
-            if (num_allocs == 4) 
-			{
-                return gotdata;
-            }
-            ++num_allocs;
-            char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
-            if (!new_rbuf) 
-			{ 
-                if (gstSettings.bVerbose > 0) 
-				{
-                    LOG_FUNC(Err, False, "Couldn't realloc input buffer\n");
-                }
-                c->rbytes = 0; /* ignore what we read */
-                //out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->write_and_go = enConnClosing;
-                return READ_MEMORY_ERROR;
-            }
-            c->rcurr = c->rbuf = new_rbuf;
-            c->rsize *= 2;
-        }
-
-        int avail = c->rsize - c->rbytes;
-        res = read(c->s32Sockfd, c->rbuf + c->rbytes, avail);
-        if (res > 0) 
-		{
-            gotdata = READ_DATA_RECEIVED;
-            c->rbytes += res;
-            if (res == avail) 
-			{
-                continue;
-            } 
-			else 
-           	{
-                break;
-            }
-        }
-        if (res == 0) 
-		{
-            return READ_ERROR;
-        }
-        if (res == -1) 
-		{
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-			{
-                break;
-            }
-            return READ_ERROR;
-        }
-    }
-    return gotdata;
-}
-static const sint8 *ENENT_CmdTypeText(uint8 u8CmdType)
-{
-	const sint8* const cmdnames[] = { "login begin",
-                                       "device message",
-                                       "heart beat",
-                                       "stream start",
-                                       "stream stop"};
-
-	return cmdnames[u8CmdType-COMMAND_START];
-}
-
-static const sint8 *ENENT_ResTypeText(uint8 u8ResType)
-{
-	const sint8* const resType[] = { "request",
-                                       "responce"};
-
-	return resType[u8ResType];
-}
-
-static sint32 EVENT_GetAttribute(ST_CONN_INFO *c, EN_ATTR_TYPE enAttrType, sint8 *attr, uint16 u16AttrLen)
-{
-	sint8 	*pos = attr;
-	uint16  leftLen = u16AttrLen;
-	uint8 	curAttrType;
-	uint16 	curAttrLen;
-	
-	do{
-		curAttrType = pos[0];
-		memcpy(&curAttrLen, &pos[1], 2);
-		if(curAttrLen > leftLen-3)
-			return FAIL; /*message error*/
-		if(curAttrType == enAttrType)
-		{
-			switch(enAttrType)
-			{
-				case enCmdRes:
-				case enErrReason:
-					break;
-				case enDevName:
-					strncpy(c->stDevInfo.devName, pos+3, curAttrLen);
-					return SUCCESS;
-				case enDevPasswd:
-					strncpy(c->stDevInfo.devPasswd, pos+3, curAttrLen);
-					return SUCCESS;
-				case enEncType:
-					c->stDevInfo.enVencType = atoi(pos+3);
-					return SUCCESS;
-				case enVoReso:
-					c->stDevInfo.enVreso = atoi(pos+3);
-					return SUCCESS;
-				case enVobit:
-					c->stDevInfo.u32VideoBit = atoi(pos+3);
-					return SUCCESS;
-				case enVoFps:
-					c->stDevInfo.u32VideoFps = atoi(pos+3);
-					return SUCCESS;
-				case enVoBrc:
-					c->stDevInfo.enVbrc = atoi(pos+3);
-					return SUCCESS;
-				case enAoType:
-					c->stDevInfo.enAencType = atoi(pos+3);
-					return SUCCESS;
-			}
-		}
-			
-		pos += (curAttrLen+3);
-		leftLen -= (curAttrLen+3);
-	}while(leftLen > 0);
-	
-	return FAIL;
-}
-
-static sint32 EVENT_SetAttribute(sint8 *buf, EN_ATTR_TYPE enAttrType, void *attr, uint16 u16AttrLen)
-{
-	buf[0] = enAttrType;
-	memcpy(&buf[1], &u16AttrLen, 2);
-	memcpy(&buf[3], attr, u16AttrLen);
-	
-	return u16AttrLen+3;
-}
-
-static void EVENT_ResponceCommand(ST_CONN_INFO *c, sint8 ret, EN_CMD_TYPE enCmdType, uint16 u32Serial)
+static void EVENT_SendCommand(ST_CONN_INFO *c, sint32 s32RetCode, EN_CMD_TYPE enCmdType, uint16 u32Serial)
 {
 	ST_CMD_HDR *pstCmdHdr = (ST_CMD_HDR *)c->wbuf;
 	uint16	u16CmdLen = 0;
@@ -801,27 +979,21 @@ static void EVENT_ResponceCommand(ST_CONN_INFO *c, sint8 ret, EN_CMD_TYPE enCmdT
 	CMD_SET_SERIL(pstCmdHdr, u32Serial+1);
 	CMD_SET_RQ(pstCmdHdr, enCmdTypeRes);
 	u16CmdLen += PROTOCAL_HEAD_LEN;
-
-	if(ret == 0)
+	
+	if(s32RetCode == 0)
 	{
-		u16CmdLen += EVENT_SetAttribute(c->wbuf+u16CmdLen, enDevName, 
-			c->stDevInfo.devName, strlen(c->stDevInfo.devName));
+		u16CmdLen += PARSE_SetAttribute(c->wbuf+u16CmdLen, enDevName, 
+			c->pstDevInfo->devName, strlen(c->pstDevInfo->devName));
+	}
 
-		u16CmdLen += EVENT_SetAttribute(c->wbuf+u16CmdLen, enCmdRes, 
-			&ret, 1);
+	if(enCmdType >= enStreamStart && enCmdType <= enStreamEnd)
+	{
+		//
 	}
 	else
 	{
-		switch(enCmdType)
-		{
-			case enDevLoginCmd:
-				u16CmdLen += EVENT_SetAttribute(c->wbuf+u16CmdLen, enCmdRes, &ret, 1);
-				break;
-			case enDevInfoCmd:
-			case enStreamStart:
-			case enStreamEnd:
-				break;
-		}
+		u16CmdLen += PARSE_SetAttribute(c->wbuf+u16CmdLen, enCmdRes, 
+			&s32RetCode, 4);
 	}
 	
 	CMD_SET_LEN(pstCmdHdr, u16CmdLen-PROTOCAL_HEAD_LEN);
@@ -835,109 +1007,223 @@ static void EVENT_ResponceCommand(ST_CONN_INFO *c, sint8 ret, EN_CMD_TYPE enCmdT
 	c->msgcurr = 0;
 	c->msgused = 0;
 	c->iovused = 0;
+	WBUFFER_AddMsghdr(c);
+	CONN_SetState(c, enConnWrite);
 	
 }
 
-static sint32 EVENT_ProcessLoginCommand(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+static sint32 EVENT_CheckDeviceName(ST_CONN_INFO *c, sint8 *attr, uint16 u16AttrLen)
 {
-	assert(c != NULL);
+	sint32 s32Ret = 0;
+	sint8	strDevName[NAME_LEN] = {0};
 
-	sint32 s32Ret;
-	s32Ret = EVENT_GetAttribute(c, enDevName, attr, u16AttrLen);
+	s32Ret = PARSE_GetAttribute(strDevName, enDevName, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		LOG_FUNC(Err, False, "get devname err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevLoginCmd, u32Serial);
-		return FAIL;
+		LOG_FUNC(Err, False, "get attrute err\n");
+		return enErrLessAttr;
 	}
-	LOG_FUNC(Debug, False, "get devname %s\n", c->stDevInfo.devName);
-	s32Ret = EVENT_GetAttribute(c, enDevPasswd, attr, u16AttrLen);
-	if(s32Ret != SUCCESS)
-	{
-		LOG_FUNC(Err, False, "get devpasswd err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevLoginCmd, u32Serial);
-		return FAIL;
-	}
-	LOG_FUNC(Debug, False, "get devpasswd %s\n", c->stDevInfo.devPasswd);
-	c->stDevInfo.enDevStat = enDevLogin;
 	
-	EVENT_ResponceCommand(c, SUCCESS, enDevLoginCmd, u32Serial);
-	CONN_SetState(c, enConnWrite);
+	if(0 != memcmp(strDevName, c->pstDevInfo->devName ,NAME_LEN))
+	{
+		LOG_FUNC(Info, False, "Device name :%s not match\n", strDevName);
+		return enErrNameNotmatch;
+	}
+
 	return SUCCESS;
 }
 
-static sint32 EVENT_ProcessMessageCommand(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+static sint32 EVENT_ProcessLogin(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
 {
 	assert(c != NULL);
 
-	sint32 s32Ret;
-
-	//if(c->stDevInfo.enDevStat != enDevLogin)
-	//{
-		//LOG_FUNC(Info, False, "Login First\n");
-		//EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		//return FAIL;
-	//}
+	sint32 s32Ret = 0;
+	s32Ret += PARSE_GetAttribute(c->pstDevInfo->devName, enDevName, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(c->pstDevInfo->devPasswd, enDevPasswd, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		LOG_FUNC(Err, False, "get attrute err\n");
+		EVENT_SendCommand(c, enErrLessAttr, enDevLoginCmd, u32Serial);
+		return SUCCESS;
+	}
 	
-	s32Ret = EVENT_GetAttribute(c, enEncType, attr, u16AttrLen);
-	if(s32Ret != SUCCESS)
-	{
-		LOG_FUNC(Err, False, "get enEncType err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		return FAIL;
-	}
-	LOG_FUNC(Debug, False, "get enEncType %d\n", c->stDevInfo.enVencType);
+	LOG_FUNC(Debug, False, "get devname %s\n", c->pstDevInfo->devName);
+	LOG_FUNC(Debug, False, "get devpasswd %s\n", c->pstDevInfo->devPasswd);
+	c->pstDevInfo->enDevStat = enDevLogin;
+	EVENT_SendCommand(c, SUCCESS, enDevLoginCmd, u32Serial);
 	
-	s32Ret = EVENT_GetAttribute(c, enVoReso, attr, u16AttrLen);
+	return SUCCESS;
+}
+
+static sint32 EVENT_ProcessMessage(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+{
+	assert(c != NULL);
+	if(c->pstDevInfo->enDevStat != enDevLogin)
+	{
+		LOG_FUNC(Info, False, "Login First\n");
+		EVENT_SendCommand(c, enErrLoginFirst, enDevInfoCmd, u32Serial);
+		return SUCCESS;
+	}
+
+	sint32 s32Ret = 0;
+	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		LOG_FUNC(Err, False, "get enVoReso err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		return FAIL;
+		EVENT_SendCommand(c, s32Ret, enDevInfoCmd, u32Serial);
+		return SUCCESS;
 	}
-	LOG_FUNC(Debug, False, "get enVoReso %d\n", c->stDevInfo.enVreso);
-
-	s32Ret = EVENT_GetAttribute(c, enVobit, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enVencType, enEncType, attr, u16AttrLen);
+	//s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enVreso, enVoReso, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->u32VideoWidth, enVoWidth, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->u32VideoHeigth, enVoHeigth, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->u32VideoBit, enVobit, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->u32VideoFps, enVoFps, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enVbrc, enVoBrc, attr, u16AttrLen);
+	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enAencType, enAoType, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		LOG_FUNC(Err, False, "get enVobit err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		return FAIL;
+		LOG_FUNC(Err, False, "get attrute err\n");
+		EVENT_SendCommand(c, enErrLessAttr, enDevInfoCmd, u32Serial);
+		return SUCCESS;
 	}
-	LOG_FUNC(Debug, False, "get enVobit %d\n", c->stDevInfo.u32VideoBit);
-
-	s32Ret = EVENT_GetAttribute(c, enVoFps, attr, u16AttrLen);
-	if(s32Ret != SUCCESS)
-	{
-		LOG_FUNC(Err, False, "get enVoFps err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		return FAIL;
-	}
-	LOG_FUNC(Debug, False, "get enVoFps %d\n", c->stDevInfo.u32VideoFps);
-
-	s32Ret = EVENT_GetAttribute(c, enVoBrc, attr, u16AttrLen);
-	if(s32Ret != SUCCESS)
-	{
-		LOG_FUNC(Err, False, "get enVoBrc err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		return FAIL;
-	}
-	LOG_FUNC(Debug, False, "get enVoBrc %d\n", c->stDevInfo.enVbrc);
-
 	
-	s32Ret = EVENT_GetAttribute(c, enAoType, attr, u16AttrLen);
+	LOG_FUNC(Debug, False, "get enEncType %d\n", c->pstDevInfo->enVencType);
+	//LOG_FUNC(Debug, False, "get enVoReso %d\n", c->pstDevInfo->enVreso);
+	LOG_FUNC(Debug, False, "get enVoWidth %d\n", c->pstDevInfo->u32VideoWidth);
+	LOG_FUNC(Debug, False, "get enVoHeigth %d\n", c->pstDevInfo->u32VideoHeigth);
+	LOG_FUNC(Debug, False, "get enVobit %d\n", c->pstDevInfo->u32VideoBit);
+	LOG_FUNC(Debug, False, "get enVoFps %d\n", c->pstDevInfo->u32VideoFps);
+	LOG_FUNC(Debug, False, "get enVoBrc %d\n", c->pstDevInfo->enVbrc);
+	LOG_FUNC(Debug, False, "get enAoType %d\n", c->pstDevInfo->enAencType);
+	
+	c->pstDevInfo->enDevStat = enDevMessage;
+	EVENT_SendCommand(c, SUCCESS, enDevInfoCmd, u32Serial);
+
+	return SUCCESS;
+}
+
+static sint32 EVENT_ProcessHeartbeat(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+{
+	assert(c != NULL);
+	if(c->pstDevInfo->enDevStat != enDevMessage)
+	{
+		LOG_FUNC(Info, False, "Login First\n");
+		EVENT_SendCommand(c, enErrLoginFirst, enSendHeartBeat, u32Serial);
+		return SUCCESS;
+	}
+
+	sint32 	s32Ret = 0;
+	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		LOG_FUNC(Err, False, "get enAoType err\n");
-		EVENT_ResponceCommand(c, FAIL, enDevInfoCmd, u32Serial);
-		return FAIL;
+		EVENT_SendCommand(c, s32Ret, enSendHeartBeat, u32Serial);
+		return SUCCESS;
 	}
-	LOG_FUNC(Debug, False, "get enAoType %d\n", c->stDevInfo.enAencType);
+
+	c->pstDevInfo->enDevStat = enDevHeartBeat;
+	EVENT_SendCommand(c, SUCCESS, enSendHeartBeat, u32Serial);
 	
-	c->stDevInfo.enDevStat = enDevMessage;
-	EVENT_ResponceCommand(c, SUCCESS, enDevMessage, u32Serial);
+	return SUCCESS;
+}
+
+static sint32 EVENT_ProcessStreamStart(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+{
+	assert(c != NULL);
+	if(c->pstDevInfo->enDevStat != enDevHeartBeat)
+	{
+		LOG_FUNC(Info, False, "Login First\n");
+		return SUCCESS;
+	}
+
+	sint32 	s32Ret = 0;
+	sint32 	s32CmdResutl;
+	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		return SUCCESS;
+	}
+
+	s32Ret = PARSE_GetAttribute(&s32CmdResutl, enCmdRes, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		LOG_FUNC(Err, False, "get attrute err\n");
+		return SUCCESS;
+	}
+
+	if(s32CmdResutl != 0)
+	{
+		LOG_FUNC(Info, False, "Start transf stream error\n");
+	}
+	else
+	{
+		LOG_FUNC(Info, False, "Start transf stream successful\n");
+		if (!(c->pstRingBuf = (ST_RING_BUF *)calloc(1, sizeof(ST_RING_BUF)))) 
+		{
+            LOG_FUNC(Err, True, "Failed to allocate ringbuf struct\n");
+            exit(-1);
+        }
+		RingBuffer_Init(c->pstRingBuf);
+		c->pstDevInfo->enDevStat = enDevTransfStream;
+	}
+
+	CONN_SetState(c, enConnNewCmd);
+	return SUCCESS;
+}
+
+static sint32 EVENT_ProcessStreamStop(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+{
+	assert(c != NULL);
+	if(c->pstDevInfo->enDevStat != enDevTransfStream)
+	{
+		LOG_FUNC(Info, False, "start stream First\n");
+		return SUCCESS;
+	}
+
+	sint32 	s32Ret = 0;
+	sint32 	s32CmdResutl;
+	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
+	if(s32Ret != SUCCESS) 	
+		return SUCCESS;
 	
-	CONN_SetState(c, enConnWrite);
+	s32Ret = PARSE_GetAttribute(&s32CmdResutl, enCmdRes, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		LOG_FUNC(Err, False, "get attrute err\n");
+		return SUCCESS;
+	}
+
+	if(s32CmdResutl != 0)
+	{
+		LOG_FUNC(Info, False, "Stop transf stream error\n");
+	}
+	else
+	{
+		LOG_FUNC(Info, False, "Stop transf stream successful\n");
+		c->pstDevInfo->enDevStat = enDevHeartBeat;
+	}
+
+	CONN_SetState(c, enConnNewCmd);
+	return SUCCESS;
+}
+
+static sint32 EVENT_ProcessStreamData(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
+{
+	assert(c != NULL);
+	if(c->pstDevInfo->enDevStat != enDevTransfStream)
+	{
+		LOG_FUNC(Info, False, "start stream First\n");
+		return SUCCESS;
+	}
+
+	sint8 	*dataBuf = NULL;
+	sint32	dateLen;
+	dateLen = PARSE_GetAttributeAddr(&dataBuf, enStreamData, attr, u16AttrLen);
+	if(dateLen != FAIL)
+	{
+		RingBuffer_Write(c->pstRingBuf, dateLen, dataBuf, time((time_t*)NULL));
+	}
+
+	CONN_SetState(c, enConnNewCmd);
 	return SUCCESS;
 }
 
@@ -952,21 +1238,31 @@ static sint32 EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
 								"serial: %d\n"
 								"res type: %s\n"
 								"cmd len: %d\n",
-								ENENT_CmdTypeText(pstCmdHdr->u8CmdType),
+								PARSE_CmdTypeText(pstCmdHdr->u8CmdType),
 								pstCmdHdr->u16SerilNum,
-								ENENT_ResTypeText(pstCmdHdr->u8CmdRQ),
+								PARSE_ResTypeText(pstCmdHdr->u8CmdRQ),
 								pstCmdHdr->u16CmdLen);
 		
 		switch(pstCmdHdr->u8CmdType)
 		{
 			case enDevLoginCmd:
-				return EVENT_ProcessLoginCommand(c, command+PROTOCAL_HEAD_LEN, 
+				return EVENT_ProcessLogin(c, command+PROTOCAL_HEAD_LEN, 
 							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
 			case enDevInfoCmd:
-				return EVENT_ProcessMessageCommand(c, command+PROTOCAL_HEAD_LEN, 
+				return EVENT_ProcessMessage(c, command+PROTOCAL_HEAD_LEN, 
+							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+			case enSendHeartBeat:
+				return EVENT_ProcessHeartbeat(c, command+PROTOCAL_HEAD_LEN, 
 							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
 			case enStreamStart:
+				return EVENT_ProcessStreamStart(c, command+PROTOCAL_HEAD_LEN, 
+							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
 			case enStreamEnd:
+				return EVENT_ProcessStreamStop(c, command+PROTOCAL_HEAD_LEN, 
+							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+			case enStreamSenddata:
+				return EVENT_ProcessStreamData(c, command+PROTOCAL_HEAD_LEN, 
+							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
 			default:
 				LOG_FUNC(Err, False, "Unknow message\n");
 				break;
@@ -979,7 +1275,7 @@ static sint32 EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
 /*
  * if we have a complete line in the buffer, process it.
  */
-static sint32 EVENT_TryReadCommand(ST_CONN_INFO *c) 
+static sint32 EVENT_TryReadDevCommand(ST_CONN_INFO *c) 
 {
     assert(c != NULL);
     assert(c->rcurr <= (c->rbuf + c->rsize));
@@ -1026,130 +1322,16 @@ static sint32 EVENT_TryReadCommand(ST_CONN_INFO *c)
 	
 	/*we need more data*/
     return FAIL;
+	
 }
 
-/*
- * Adds a message header to a connection.
- *
- * Returns 0 on success, -1 on out-of-memory.
- */
-static int add_msghdr(ST_CONN_INFO *c)
+static sint32 EVENT_TryReadPlayerCommand(ST_CONN_INFO *c)
 {
-    struct msghdr *msg;
+	assert(c != NULL);
+    assert(c->rcurr <= (c->rbuf + c->rsize));
+    assert(c->rbytes > 0);
 
-    assert(c != NULL);
-
-    if (c->msgsize == c->msgused) 
-	{
-        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
-        if (! msg) 
-		{
-          	LOG_FUNC(Err, True, "realloc error");
-            return -1;
-        }
-        c->msglist = msg;
-        c->msgsize *= 2;
-    }
-
-    msg = c->msglist + c->msgused;
-
-    /* this wipes msg_iovlen, msg_control, msg_controllen, and
-       msg_flags, the last 3 of which aren't defined on solaris: */
-    memset(msg, 0x0, sizeof(struct msghdr));
-
-    msg->msg_iov = &c->iov[c->iovused];
-
-    c->msgbytes = 0;
-    c->msgused++;
-
-    return 0;
-}
-
-/*
- * Ensures that there is room for another struct iovec in a connection's
- * iov list.
- *
- * Returns 0 on success, -1 on out-of-memory.
- */
-static int ensure_iov_space(ST_CONN_INFO *c) 
-{
-    assert(c != NULL);
-
-    if (c->iovused >= c->iovsize) 
-	{
-        int i, iovnum;
-        struct iovec *new_iov = (struct iovec *)realloc(c->iov,
-                                (c->iovsize * 2) * sizeof(struct iovec));
-        if (! new_iov) 
-		{
-            LOG_FUNC(Err, True, "realloc error");
-            return -1;
-        }
-        c->iov = new_iov;
-        c->iovsize *= 2;
-
-        /* Point all the msghdr structures at the new list. */
-        for (i = 0, iovnum = 0; i < c->msgused; i++) 
-		{
-            c->msglist[i].msg_iov = &c->iov[iovnum];
-            iovnum += c->msglist[i].msg_iovlen;
-        }
-    }
-
-    return 0;
-}
-
-/*
- * Adds data to the list of pending data that will be written out to a
- * connection.
- *
- * Returns 0 on success, -1 on out-of-memory.
- */
-static int add_iov(ST_CONN_INFO *c, const void *buf, sint32 len) 
-{
-    struct msghdr *m;
-    int leftover;
-
-    assert(c != NULL);
-
-	add_msghdr(c);
-
-    do {
-        m = &c->msglist[c->msgused-1];
-
-        /* We may need to start a new msghdr if this one is full. */
-        if (m->msg_iovlen == IOV_MAX || (c->msgbytes >= MAX_PAYLOAD_SIZE)) 
-		{
-            add_msghdr(c);
-            m = &c->msglist[c->msgused-1];
-        }
-
-        if (ensure_iov_space(c) != 0)
-            return -1;
-
-        /* If the fragment is too big to fit in the datagram, split it up */
-        if (len + c->msgbytes > MAX_PAYLOAD_SIZE) 
-		{
-            leftover = len + c->msgbytes - MAX_PAYLOAD_SIZE;
-            len -= leftover;
-        } 
-		else 
-		{
-            leftover = 0;
-        }
-
-        m = &c->msglist[c->msgused-1];
-        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
-        m->msg_iov[m->msg_iovlen].iov_len = len;
-        c->msgbytes += len;
-        c->iovused++;
-        m->msg_iovlen++;
-		
-        buf = ((char *)buf) + len;
-        len = leftover;
-    } while (leftover > 0);
-
-    return 0;
+	return RTSP_SessionProcess(c);
 }
 
 /*
@@ -1161,7 +1343,7 @@ static int add_iov(ST_CONN_INFO *c, const void *buf, sint32 len)
  *   TRANSMIT_SOFT_ERROR Can't write any more right now.
  *   TRANSMIT_HARD_ERROR Can't write (c->state is set to conn_closing)
  */
-static EN_TRENSMIT_RES transmit(ST_CONN_INFO *c) 
+static EN_TRENSMIT_RES EVENT_Transmit(ST_CONN_INFO *c) 
 {
     assert(c != NULL);
 
@@ -1338,7 +1520,7 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
             	stop = true;
            	 	break;
 			case enConnRead:
-				s32Ret = EVENT_TryReadNetwork(c);
+				s32Ret = RBUFFER_TryReadNetwork(c);
 				switch(s32Ret)
 				{
 					 case READ_NO_DATA_RECEIVED:
@@ -1356,8 +1538,16 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
             	}
            		break; 
 			case enConnParseCmd:
-				if(EVENT_TryReadCommand(c) == FAIL)
-					CONN_SetState(c, enConnWaiting);
+				if(c->enConnType == enConnPlayer)
+				{
+					if(EVENT_TryReadPlayerCommand(c) == FAIL)
+						CONN_SetState(c, enConnWaiting);
+				}
+				else
+				{
+					if(EVENT_TryReadDevCommand(c) == FAIL)
+						CONN_SetState(c, enConnWaiting);
+				}
 				break;
 			case enConnWrite:
 				/*
@@ -1368,7 +1558,7 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 				
 				if (c->iovused == 0) 
 				{
-					if (add_iov(c, c->wcurr, c->wbytes) != 0) 
+					if (WBUFFER_AddIov(c, c->wcurr, c->wbytes) != 0) 
 					{
 						if (gstSettings.bVerbose > 0)
 							LOG_FUNC(Err, False, "Couldn't build response\n");
@@ -1376,7 +1566,7 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 						break;
 					}
 				}
-				switch(transmit(c))
+				switch(EVENT_Transmit(c))
 				{
 					case TRANSMIT_COMPLETE:
 						CONN_SetState(c, enConnNewCmd);
@@ -1426,7 +1616,7 @@ void EVENT_ConnHandler(const sint32 fd, const sint16 which, void *arg)
     }
 
     EVENT_DriveMachine(c);
-
+	
     /* wait for next event */
     return;
 }
@@ -1477,6 +1667,8 @@ int main(int argc, char *argv[])
 	THERAD_RelaysrvInit(gstSettings.s32ThreadNum, gebMainBase);
 
 	CONN_ServerSocket(NULL, 11211);
+
+	CONN_ServerSocket(NULL, 554);
 
 	EVENT_ClockHandler(0,0,0);
 	/* enter the event loop */
