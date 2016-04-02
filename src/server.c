@@ -518,6 +518,27 @@ static int CONN_ServerSocket(const char *interface, sint32 port)
     return success == 0;
 }
 
+/*player connect map to device connect*/
+ST_CONN_INFO *CONN_CheckMapConnect(sint8 *name, sint8 *passwd)
+{
+	sint32 loop;
+	
+	for(loop = 0; loop < gs32MaxFds; loop++)
+	{
+		if(ppstConnList[loop] != NULL && ppstConnList[loop]->enConnType == enConnDevice)
+		{
+			if(strlen(name) == strlen(ppstConnList[loop]->pstDevInfo->devName) && 
+				ppstConnList[loop]->pstDevInfo->enDevStat >= enDevHeartBeat && 
+				strncmp(name, ppstConnList[loop]->pstDevInfo->devName, strlen(name)) == 0)
+			{
+				return ppstConnList[loop];
+			}
+		}
+	}
+
+	return NULL;
+}
+
 /*
  * Shrinks a connection's buffers if they're too big.  This prevents
  * periodic large "get" requests from permanently chewing lots of server

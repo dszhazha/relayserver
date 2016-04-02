@@ -18,11 +18,12 @@
 
 #include "server.h"
 #include "rtsp.h"
+#include "md5.h"
 
 /*extern function*/
 extern int WBUFFER_AddMsghdr(ST_CONN_INFO *c);
 extern void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState);
-
+extern ST_CONN_INFO *CONN_CheckMapConnect(sint8 *name, sint8 *passwd);
 
 /* clear recv and send buffer*/
 #define RTSP_CLEAR_SENDBUF(c)   \
@@ -217,19 +218,18 @@ sint32 RTSP_GetHead(sint32 err, ST_CONN_INFO *c)
 
 void RTSP_GetMulticastPara(ST_MULTICAST_PARA *pmp)
 {
-    memcpy(pmp->multicast_ip,MULTICAST_IP,9);
+    memcpy(pmp->multicast_ip, MULTICAST_IP, 9);
     pmp->multicast_port = MULTICAST_PORT;
     pmp->multicast_ttl = MULTICAST_TTL;
 }
 
 sint32 RTSP_SendReply(sint32 err, sint32 simple, char *addon, ST_CONN_INFO *c)
 {
-    sint32 n;
     sint8 *pTmp = c->wbuf;
 
     if(simple == 1)
     {
-        pTmp += RTSP_GetHead(err, pSess);
+        pTmp += RTSP_GetHead(err, c);
     }
 
     if(addon)
@@ -347,7 +347,7 @@ sint32 RTSP_ParseUrl(sint32 *port, sint8 *server, sint8 *fileName, const sint8 *
 
 sint32 RTSP_PraseUserPwd(sint8 *buff, sint8 *name, sint8 *passwd)
 {
-	char *p,*q,*r = NULL;
+	char *p,*q = NULL;
 	
 	p = strstr(buff, RTSP_USER);
 	if(p == NULL)
@@ -370,26 +370,6 @@ sint32 RTSP_PraseUserPwd(sint8 *buff, sint8 *name, sint8 *passwd)
 	memcpy(passwd, p, q-p);
 
 	return SUCCESS;
-}
-
-ST_CONN_INFO *RTSP_CheckMapConnect(sint8 *name, sint8 *passwd)
-{
-	sint32 loop;
-	
-	for(loop = 0; loop < gs32MaxFds; loop++)
-	{
-		if(ppstConnList[loop] != NULL && ppstConnList[loop]->enConnType == enConnDevice)
-		{
-			if(strlen(name) == strlen(ppstConnList[loop]->pstDevInfo->devName) && 
-				ppstConnList[loop]->pstDevInfo->enDevStat >= enDevHeartBeat && 
-				strncmp(name, ppstConnList[loop]->pstDevInfo->devName, strlen(name)) == 0)
-			{
-				return ppstConnList[loop];
-			}
-		}
-	}
-
-	return NULL;
 }
 
 sint32 RTSP_EventHandleOptions(ST_CONN_INFO *c)
@@ -498,7 +478,7 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 		return FAIL;
 	}
 	
-	c->pRtspSess->pstDevSession = RTSP_CheckMapConnect(user, pwd);
+	c->pRtspSess->pstDevSession = CONN_CheckMapConnect(user, pwd);
 	if(c->pRtspSess->pstDevSession == NULL)
 	{
 		LOG_FUNC(Err, False, "device name found !\n");
@@ -522,6 +502,7 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 				pds->pstDevInfo->u32VideoBit);
 
 	pTmp += sprintf(pTmp, "Content-Type: application/sdp\r\n");
+	
 	
 }
 

@@ -267,7 +267,7 @@ typedef struct rtspSession
 	uint32	u32LastSendSeq;	
 	uint32	u32LastRecvSeq;
 
-	ST_CONN_INFO *pstDevSession;
+	void 	*pstDevSession;
 	
 }ST_RTSP_SESSION;
 
