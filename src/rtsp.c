@@ -372,6 +372,21 @@ sint32 RTSP_PraseUserPwd(sint8 *buff, sint8 *name, sint8 *passwd)
 	return SUCCESS;
 }
 
+static sint32 RTSP_GetHostInfo(sint32 sockFd, sint8 *ipAddr)
+{
+	socklen_t addrLen;
+	struct sockaddr_in hostAddr;
+
+	addrLen = sizeof(hostAddr);
+	if( -1 == getsockname(sockFd, (struct sockaddr *)&hostAddr, &addrLen))
+	{
+		LOG_FUNC(Err, False, "getsockname error \n");
+		return FAIL;
+	}
+	strncpy(ipAddr, (const char *)inet_ntoa(hostAddr.sin_addr), 64);
+	return SUCCESS;
+}
+
 sint32 RTSP_EventHandleOptions(ST_CONN_INFO *c)
 {
     sint32 station;
@@ -486,7 +501,13 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 		return FAIL;
 	}
 
-	ST_CONN_INFO *pds = c->pRtspSess->pstDevSession;
+	if(SUCCESS != RTSP_GetHostInfo(c->s32Sockfd, c->pRtspSess->hostIp))
+	{
+   		LOG_FUNC(Err, False, "RTSP_GetHostInfo error!\n");
+		return FAIL;
+	}
+
+	ST_CONN_INFO *pds = (ST_CONN_INFO *)c->pRtspSess->pstDevSession;
 	RTSP_CLEAR_SENDBUF(c);
 	pTmp = c->wbuf;
 	pTmp += sprintf(pTmp, "%s %d %s\r\n", RTSP_VERSION, 200, RTSP_GetMethodDescrib(200));
@@ -502,6 +523,43 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 				pds->pstDevInfo->u32VideoBit);
 
 	pTmp += sprintf(pTmp, "Content-Type: application/sdp\r\n");
+
+	p += sprintf(p,"v=0\r\n");
+    p += sprintf(p,"o=StreamingServer 3331435948 1116907222000 IN IP4 %s\r\n", c->pRtspSess->hostIp);
+    p += sprintf(p,"s=h264.mp4\r\n");
+	
+	if(0==strcmp(stMulticastPara.multicast_ip,"0.0.0.0"))
+    	p += sprintf(p,"c=IN IP4 0.0.0.0\r\n");
+	else	
+		/*read db or config ,otherwise defalu 0.0.0.0*/
+   		p += sprintf(p,"c=IN IP4 %s/%d\r\n",stMulticastPara.multicast_ip,stMulticastPara.multicast_ttl);
+    p += sprintf(p,"t=0 0\r\n");
+    p += sprintf(p,"a=control:*\r\n");
+
+	/*video and audio description*/
+	switch(pds->pstDevInfo->enVencType)
+	{
+		case enVencH264:
+			p += sprintf(p,"m=video 0 RTP/AVP 96\r\n");
+		    p += sprintf(p,"a=control:trackID=0\r\n");
+		    p += sprintf(p,"a=rtpmap:96 H264/90000\r\n");
+			p += sprintf(p,"a=fmtp:96 packetization-mode=1; "
+				"sprop-parameter-sets=%s\r\n", (char *)RTSP_Media_Para_GetBase64(ch));//º”√‹
+			break;
+		case enVencMJPEG:
+			p += sprintf(p,"m=video 0 RTP/AVP 26\r\n");
+			p += sprintf(p,"a=control:trackID=0\r\n");
+			p += sprintf(p,"a=rtpmap:26 JPEG/90000\r\n");
+			break;
+		default:
+			p += sprintf(p,"m=video 0 RTP/AVP 96\r\n");
+		    p += sprintf(p,"a=control:trackID=0\r\n");
+		    p += sprintf(p,"a=rtpmap:96 H264/90000\r\n");
+			p += sprintf(p,"a=fmtp:96 packetization-mode=1; "
+				"sprop-parameter-sets=%s\r\n", (char *)RTSP_Media_Para_GetBase64(ch));//º”√‹
+			break;
+	}
+
 	
 	
 }

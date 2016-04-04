@@ -261,6 +261,7 @@ typedef struct RingBuffer
 typedef struct rtspSession
 {
 	sint8	userAgent[128];
+	sint8	hostIp[64];
 	
 	sint32	clientType;
 	sint32	s32LastSendReq;
