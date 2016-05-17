@@ -83,10 +83,10 @@ extern void STATS_LOCK(void);
 extern void STATS_UNLOCK(void); 
 
 extern void RingBuffer_Init(ST_RING_BUF *ab);
-extern void RingBuffer_Write(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTime);
-
+extern void RingBuffer_Write(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTime, sint32 streamType, uint32 pts);
 extern sint32 RTSP_SessionProcess(ST_CONN_INFO *c);
-
+extern sint32 RTSP_SessionCreate(ST_CONN_INFO *c);
+void EVENT_SendReqCommand(ST_CONN_INFO *c, EN_CMD_TYPE enCmdType, uint16 u32Serial);
 
 static void SETTINGS_Init(void)
 {
@@ -211,7 +211,7 @@ void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState)
     }
 }
 
-static void CONN_SocketClose(ST_CONN_INFO *c) 
+void CONN_SocketClose(ST_CONN_INFO *c) 
 {
     assert(c != NULL);
 
@@ -223,10 +223,10 @@ static void CONN_SocketClose(ST_CONN_INFO *c)
     CONN_SetState(c, enConnClosed);
     close(c->s32Sockfd);
 
-	if(c->pRtspSess != NULL)
+	if(c->pstRtspSess != NULL)
 	{
-		free(c->pRtspSess);
-		c->pRtspSess = NULL;
+		free(c->pstRtspSess);
+		c->pstRtspSess = NULL;
 	}
 		
 	if(c->pstDevInfo != NULL)
@@ -267,8 +267,8 @@ void CONN_NodeFree(ST_CONN_INFO *c)
             free(c->wbuf);
         if (c->iov)
             free(c->iov);
-		if(c->pRtspSess != NULL)
-			free(c->pRtspSess);
+		if(c->pstRtspSess != NULL)
+			free(c->pstRtspSess);
 		if(c->pstDevInfo != NULL)
 			free(c->pstDevInfo);
 		if(c->pstRingBuf != NULL)
@@ -349,9 +349,9 @@ ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
 
 	c->pstRingBuf = NULL;
 	//c->pstDevInfo = NULL;
-	//c->pRtspSess = NULL;
+	//c->pstRtspSess = NULL;
 	
-	if(enConnType == enConnDevice)
+	if (enConnType == enConnDevice)
 	{
 		c->pstDevInfo = (ST_DEV_INFO *)calloc(1, sizeof(ST_DEV_INFO));
 		if (c->pstDevInfo == NULL) 
@@ -362,12 +362,10 @@ ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
 	}		
 	else if(enConnType == enConnPlayer)
 	{
-		c->pRtspSess = (ST_RTSP_SESSION *)calloc(1, sizeof(ST_RTSP_SESSION));
-		if (c->pRtspSess == NULL) 
+		if (SUCCESS != RTSP_SessionCreate(c))
 		{
-            LOG_FUNC(Err, True, "Failed to allocate rtsp session\n");
-            return NULL;
-        }
+			return NULL;
+		}
 	}
 			
     event_set(&c->evConnEvent, sfd, event_flags, EVENT_ConnHandler, (void *)c);
@@ -522,7 +520,6 @@ static int CONN_ServerSocket(const char *interface, sint32 port)
 ST_CONN_INFO *CONN_CheckMapConnect(sint8 *name, sint8 *passwd)
 {
 	sint32 loop;
-	
 	for(loop = 0; loop < gs32MaxFds; loop++)
 	{
 		if(ppstConnList[loop] != NULL && ppstConnList[loop]->enConnType == enConnDevice)
@@ -537,6 +534,35 @@ ST_CONN_INFO *CONN_CheckMapConnect(sint8 *name, sint8 *passwd)
 	}
 
 	return NULL;
+}
+
+sint32 CONN_CheckStreamStart(ST_CONN_INFO *c)
+{
+	if(c->enConnType != enConnDevice)
+		return FAIL;
+
+	if(c->pstDevInfo->enDevStat < enDevHeartBeat)
+		return FAIL;
+	
+	if(c->pstDevInfo->enDevStat != enDevTransfStream)
+	{
+		EVENT_SendReqCommand(c, enStreamStart, 1);
+	}
+
+	return SUCCESS;
+}
+
+sint32 CONN_CheckStreamStop(ST_CONN_INFO *c)
+{
+	if(c->enConnType != enConnDevice)
+		return FAIL;
+
+	if(c->pstDevInfo->enDevStat == enDevTransfStream)
+	{
+		EVENT_SendReqCommand(c, enStreamEnd, 2);
+	}
+
+	return SUCCESS;
 }
 
 /*
@@ -799,11 +825,12 @@ static int WBUFFER_AddIov(ST_CONN_INFO *c, const void *buf, sint32 len)
 
 static const sint8 *PARSE_CmdTypeText(uint8 u8CmdType)
 {
-	const sint8* const cmdnames[] = { "login begin",
+	const char* const cmdnames[] = { "login begin",
                                        "device message",
                                        "heart beat",
                                        "stream start",
-                                       "stream stop"};
+                                       "stream stop",
+                                       "stream data"};
 
 	return cmdnames[u8CmdType-COMMAND_START];
 }
@@ -990,7 +1017,28 @@ static bool EVENT_UpdateEvent(ST_CONN_INFO *c, const sint32 new_flags)
     return true;
 }
 
-static void EVENT_SendCommand(ST_CONN_INFO *c, sint32 s32RetCode, EN_CMD_TYPE enCmdType, uint16 u32Serial)
+static sint32 EVENT_CheckDeviceName(ST_CONN_INFO *c, sint8 *attr, uint16 u16AttrLen)
+{
+	sint32 s32Ret = 0;
+	sint8	strDevName[NAME_LEN] = {0};
+
+	s32Ret = PARSE_GetAttribute(strDevName, enDevName, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		LOG_FUNC(Err, False, "get attrute err\n");
+		return enErrLessAttr;
+	}
+	
+	if(0 != memcmp(strDevName, c->pstDevInfo->devName ,NAME_LEN))
+	{
+		LOG_FUNC(Info, False, "Device name :%s not match\n", strDevName);
+		return enErrNameNotmatch;
+	}
+
+	return SUCCESS;
+}
+
+void EVENT_SendResCommand(ST_CONN_INFO *c, sint32 s32RetCode, EN_CMD_TYPE enCmdType, uint16 u32Serial)
 {
 	ST_CMD_HDR *pstCmdHdr = (ST_CMD_HDR *)c->wbuf;
 	uint16	u16CmdLen = 0;
@@ -1033,25 +1081,39 @@ static void EVENT_SendCommand(ST_CONN_INFO *c, sint32 s32RetCode, EN_CMD_TYPE en
 	
 }
 
-static sint32 EVENT_CheckDeviceName(ST_CONN_INFO *c, sint8 *attr, uint16 u16AttrLen)
+void EVENT_SendReqCommand(ST_CONN_INFO *c, EN_CMD_TYPE enCmdType, uint16 u32Serial)
 {
-	sint32 s32Ret = 0;
-	sint8	strDevName[NAME_LEN] = {0};
+	ST_CMD_HDR *pstCmdHdr = (ST_CMD_HDR *)c->wbuf;
+	uint16	u16CmdLen = 0;
+	CMD_SET_HEAD1(pstCmdHdr, HEAD_BYTE1);
+	CMD_SET_HEAD2(pstCmdHdr, HEAD_BYTE2);
+	CMD_SET_TYPE(pstCmdHdr, enCmdType);
+	CMD_SET_SERIL(pstCmdHdr, u32Serial);
+	CMD_SET_RQ(pstCmdHdr, enCmdTypeReq);
+	u16CmdLen += PROTOCAL_HEAD_LEN;
 
-	s32Ret = PARSE_GetAttribute(strDevName, enDevName, attr, u16AttrLen);
-	if(s32Ret != SUCCESS)
+	if(enCmdType >= enStreamStart && enCmdType <= enStreamEnd)
 	{
-		LOG_FUNC(Err, False, "get attrute err\n");
-		return enErrLessAttr;
+		u16CmdLen += PARSE_SetAttribute(c->wbuf+u16CmdLen, enDevName, 
+		c->pstDevInfo->devName, strlen(c->pstDevInfo->devName));
 	}
 	
-	if(0 != memcmp(strDevName, c->pstDevInfo->devName ,NAME_LEN))
-	{
-		LOG_FUNC(Info, False, "Device name :%s not match\n", strDevName);
-		return enErrNameNotmatch;
-	}
+	
+	CMD_SET_LEN(pstCmdHdr, u16CmdLen-PROTOCAL_HEAD_LEN);
+	CMD_SET_TAIL(c->wbuf[u16CmdLen], TAIL_BYTE1);
+	CMD_SET_TAIL(c->wbuf[u16CmdLen+1], TAIL_BYTE2);
+	u16CmdLen += 2;
 
-	return SUCCESS;
+	c->wcurr = c->wbuf;
+	c->wbytes = u16CmdLen;
+	
+	c->msgcurr = 0;
+	c->msgused = 0;
+	c->iovused = 0;
+	WBUFFER_AddMsghdr(c);
+	CONN_SetState(c, enConnWrite);
+	EVENT_UpdateEvent(c, EV_WRITE | EV_PERSIST);
+	
 }
 
 static sint32 EVENT_ProcessLogin(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
@@ -1064,14 +1126,14 @@ static sint32 EVENT_ProcessLogin(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLe
 	if(s32Ret != SUCCESS)
 	{
 		LOG_FUNC(Err, False, "get attrute err\n");
-		EVENT_SendCommand(c, enErrLessAttr, enDevLoginCmd, u32Serial);
+		EVENT_SendResCommand(c, enErrLessAttr, enDevLoginCmd, u32Serial);
 		return SUCCESS;
 	}
 	
 	LOG_FUNC(Debug, False, "get devname %s\n", c->pstDevInfo->devName);
 	LOG_FUNC(Debug, False, "get devpasswd %s\n", c->pstDevInfo->devPasswd);
 	c->pstDevInfo->enDevStat = enDevLogin;
-	EVENT_SendCommand(c, SUCCESS, enDevLoginCmd, u32Serial);
+	EVENT_SendResCommand(c, SUCCESS, enDevLoginCmd, u32Serial);
 	
 	return SUCCESS;
 }
@@ -1082,7 +1144,7 @@ static sint32 EVENT_ProcessMessage(ST_CONN_INFO *c,  sint8 *attr, uint16 u16Attr
 	if(c->pstDevInfo->enDevStat != enDevLogin)
 	{
 		LOG_FUNC(Info, False, "Login First\n");
-		EVENT_SendCommand(c, enErrLoginFirst, enDevInfoCmd, u32Serial);
+		EVENT_SendResCommand(c, enErrLoginFirst, enDevInfoCmd, u32Serial);
 		return SUCCESS;
 	}
 
@@ -1090,7 +1152,7 @@ static sint32 EVENT_ProcessMessage(ST_CONN_INFO *c,  sint8 *attr, uint16 u16Attr
 	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		EVENT_SendCommand(c, s32Ret, enDevInfoCmd, u32Serial);
+		EVENT_SendResCommand(c, s32Ret, enDevInfoCmd, u32Serial);
 		return SUCCESS;
 	}
 	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enVencType, enEncType, attr, u16AttrLen);
@@ -1101,10 +1163,11 @@ static sint32 EVENT_ProcessMessage(ST_CONN_INFO *c,  sint8 *attr, uint16 u16Attr
 	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->u32VideoFps, enVoFps, attr, u16AttrLen);
 	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enVbrc, enVoBrc, attr, u16AttrLen);
 	s32Ret += PARSE_GetAttribute(&c->pstDevInfo->enAencType, enAoType, attr, u16AttrLen);
+	strcpy(c->pstDevInfo->Base64, "Z00AH9oBQBbsBagQEBIAAAMA8AAAOEDAgADR9gAHYaXvfCQ=,aO48gA==");
 	if(s32Ret != SUCCESS)
 	{
 		LOG_FUNC(Err, False, "get attrute err\n");
-		EVENT_SendCommand(c, enErrLessAttr, enDevInfoCmd, u32Serial);
+		EVENT_SendResCommand(c, enErrLessAttr, enDevInfoCmd, u32Serial);
 		return SUCCESS;
 	}
 	
@@ -1118,7 +1181,7 @@ static sint32 EVENT_ProcessMessage(ST_CONN_INFO *c,  sint8 *attr, uint16 u16Attr
 	LOG_FUNC(Debug, False, "get enAoType %d\n", c->pstDevInfo->enAencType);
 	
 	c->pstDevInfo->enDevStat = enDevMessage;
-	EVENT_SendCommand(c, SUCCESS, enDevInfoCmd, u32Serial);
+	EVENT_SendResCommand(c, SUCCESS, enDevInfoCmd, u32Serial);
 
 	return SUCCESS;
 }
@@ -1126,10 +1189,10 @@ static sint32 EVENT_ProcessMessage(ST_CONN_INFO *c,  sint8 *attr, uint16 u16Attr
 static sint32 EVENT_ProcessHeartbeat(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
 {
 	assert(c != NULL);
-	if(c->pstDevInfo->enDevStat != enDevMessage)
+	if(c->pstDevInfo->enDevStat < enDevMessage)
 	{
 		LOG_FUNC(Info, False, "Login First\n");
-		EVENT_SendCommand(c, enErrLoginFirst, enSendHeartBeat, u32Serial);
+		EVENT_SendResCommand(c, enErrLoginFirst, enSendHeartBeat, u32Serial);
 		return SUCCESS;
 	}
 
@@ -1137,12 +1200,12 @@ static sint32 EVENT_ProcessHeartbeat(ST_CONN_INFO *c,  sint8 *attr, uint16 u16At
 	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		EVENT_SendCommand(c, s32Ret, enSendHeartBeat, u32Serial);
+		EVENT_SendResCommand(c, s32Ret, enSendHeartBeat, u32Serial);
 		return SUCCESS;
 	}
 
 	c->pstDevInfo->enDevStat = enDevHeartBeat;
-	EVENT_SendCommand(c, SUCCESS, enSendHeartBeat, u32Serial);
+	EVENT_SendResCommand(c, SUCCESS, enSendHeartBeat, u32Serial);
 	
 	return SUCCESS;
 }
@@ -1153,6 +1216,7 @@ static sint32 EVENT_ProcessStreamStart(ST_CONN_INFO *c,  sint8 *attr, uint16 u16
 	if(c->pstDevInfo->enDevStat != enDevHeartBeat)
 	{
 		LOG_FUNC(Info, False, "Login First\n");
+		CONN_SetState(c, enConnNewCmd);
 		return SUCCESS;
 	}
 
@@ -1161,14 +1225,14 @@ static sint32 EVENT_ProcessStreamStart(ST_CONN_INFO *c,  sint8 *attr, uint16 u16
 	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
-		return SUCCESS;
+		return FAIL;
 	}
 
 	s32Ret = PARSE_GetAttribute(&s32CmdResutl, enCmdRes, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
 		LOG_FUNC(Err, False, "get attrute err\n");
-		return SUCCESS;
+		return FAIL;
 	}
 
 	if(s32CmdResutl != 0)
@@ -1197,20 +1261,23 @@ static sint32 EVENT_ProcessStreamStop(ST_CONN_INFO *c,  sint8 *attr, uint16 u16A
 	if(c->pstDevInfo->enDevStat != enDevTransfStream)
 	{
 		LOG_FUNC(Info, False, "start stream First\n");
+		CONN_SetState(c, enConnNewCmd);
 		return SUCCESS;
 	}
 
 	sint32 	s32Ret = 0;
 	sint32 	s32CmdResutl;
 	s32Ret = EVENT_CheckDeviceName(c, attr, u16AttrLen);
-	if(s32Ret != SUCCESS) 	
-		return SUCCESS;
-	
+	if(s32Ret != SUCCESS) 
+	{
+		return FAIL;
+	}
+		
 	s32Ret = PARSE_GetAttribute(&s32CmdResutl, enCmdRes, attr, u16AttrLen);
 	if(s32Ret != SUCCESS)
 	{
 		LOG_FUNC(Err, False, "get attrute err\n");
-		return SUCCESS;
+		return FAIL;
 	}
 
 	if(s32CmdResutl != 0)
@@ -1236,12 +1303,31 @@ static sint32 EVENT_ProcessStreamData(ST_CONN_INFO *c,  sint8 *attr, uint16 u16A
 		return SUCCESS;
 	}
 
+	sint32 	s32Ret = 0;
 	sint8 	*dataBuf = NULL;
 	sint32	dateLen;
+	sint32	streamType;
+	uint32	pts;
+
+	s32Ret = PARSE_GetAttribute(&streamType, enStreamType, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		LOG_FUNC(Err, False, "get attrute enStreamType err\n");
+		return FAIL;
+	}
+
+	s32Ret = PARSE_GetAttribute(&pts, enStreamPts, attr, u16AttrLen);
+	if(s32Ret != SUCCESS)
+	{
+		LOG_FUNC(Err, False, "get attrute enStreamPts err\n");
+		return FAIL;
+	}
+
+	//printf("streamType=%d\n", streamType);
 	dateLen = PARSE_GetAttributeAddr(&dataBuf, enStreamData, attr, u16AttrLen);
 	if(dateLen != FAIL)
 	{
-		RingBuffer_Write(c->pstRingBuf, dateLen, dataBuf, time((time_t*)NULL));
+		RingBuffer_Write(c->pstRingBuf, dateLen, dataBuf, time((time_t*)NULL), streamType, pts);
 	}
 
 	CONN_SetState(c, enConnNewCmd);
@@ -1251,11 +1337,62 @@ static sint32 EVENT_ProcessStreamData(ST_CONN_INFO *c,  sint8 *attr, uint16 u16A
 static sint32 EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
 {
 	assert(c != NULL);
+	sint32 s32Ret = 0;
 
 	if(c->enConnType == enConnDevice)
 	{
 		ST_CMD_HDR *pstCmdHdr = (ST_CMD_HDR *)command;
-		LOG_FUNC(Debug, False, 	"cmd type: %s\n"
+		
+		if(pstCmdHdr->u8CmdRQ == enCmdTypeReq)
+		{
+			switch(pstCmdHdr->u8CmdType)
+			{
+				case enDevLoginCmd:
+					s32Ret =  EVENT_ProcessLogin(c, command+PROTOCAL_HEAD_LEN, 
+								pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+					break;
+				case enDevInfoCmd:
+					s32Ret =  EVENT_ProcessMessage(c, command+PROTOCAL_HEAD_LEN, 
+								pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+					break;
+				case enSendHeartBeat:
+					s32Ret = EVENT_ProcessHeartbeat(c, command+PROTOCAL_HEAD_LEN, 
+								pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+					break;
+				case enStreamSenddata:
+					s32Ret = EVENT_ProcessStreamData(c, command+PROTOCAL_HEAD_LEN, 
+								pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+					break;
+				default:
+					s32Ret = FAIL;
+					LOG_FUNC(Err, False, "Unknow message\n");
+					CONN_SetState(c, enConnNewCmd);
+					break;
+			}
+		}
+		else
+		{
+			switch(pstCmdHdr->u8CmdType)
+			{
+				case enStreamStart:
+					s32Ret = EVENT_ProcessStreamStart(c, command+PROTOCAL_HEAD_LEN, 
+								pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+					break;
+				case enStreamEnd:
+					s32Ret = EVENT_ProcessStreamStop(c, command+PROTOCAL_HEAD_LEN, 
+								pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
+					break;
+				default:
+					s32Ret = FAIL;
+					LOG_FUNC(Err, False, "Unknow message\n");
+					CONN_SetState(c, enConnNewCmd);
+					break;
+			}
+		}
+#if 1
+		if(s32Ret == SUCCESS && enStreamSenddata != pstCmdHdr->u8CmdType)
+		{
+			LOG_FUNC(Debug, False, 	"cmd type: %s\n"
 								"serial: %d\n"
 								"res type: %s\n"
 								"cmd len: %d\n",
@@ -1263,34 +1400,11 @@ static sint32 EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
 								pstCmdHdr->u16SerilNum,
 								PARSE_ResTypeText(pstCmdHdr->u8CmdRQ),
 								pstCmdHdr->u16CmdLen);
-		
-		switch(pstCmdHdr->u8CmdType)
-		{
-			case enDevLoginCmd:
-				return EVENT_ProcessLogin(c, command+PROTOCAL_HEAD_LEN, 
-							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
-			case enDevInfoCmd:
-				return EVENT_ProcessMessage(c, command+PROTOCAL_HEAD_LEN, 
-							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
-			case enSendHeartBeat:
-				return EVENT_ProcessHeartbeat(c, command+PROTOCAL_HEAD_LEN, 
-							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
-			case enStreamStart:
-				return EVENT_ProcessStreamStart(c, command+PROTOCAL_HEAD_LEN, 
-							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
-			case enStreamEnd:
-				return EVENT_ProcessStreamStop(c, command+PROTOCAL_HEAD_LEN, 
-							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
-			case enStreamSenddata:
-				return EVENT_ProcessStreamData(c, command+PROTOCAL_HEAD_LEN, 
-							pstCmdHdr->u16CmdLen, pstCmdHdr->u16SerilNum);
-			default:
-				LOG_FUNC(Err, False, "Unknow message\n");
-				break;
 		}
+#endif		
 	}
 
-	return FAIL;
+	return s32Ret;
 }
 
 /*
@@ -1562,7 +1676,9 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 				if(c->enConnType == enConnPlayer)
 				{
 					if(EVENT_TryReadPlayerCommand(c) == FAIL)
+					{
 						CONN_SetState(c, enConnWaiting);
+					}
 				}
 				else
 				{
@@ -1576,7 +1692,6 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 				* assemble it into a msgbuf list (this will be a single-entry
 				* list for TCP or a two-entry list for UDP).
 				*/
-				
 				if (c->iovused == 0) 
 				{
 					if (WBUFFER_AddIov(c, c->wcurr, c->wbytes) != 0) 

@@ -41,6 +41,9 @@
 #define IOV_LIST_HIGHWAT 600
 #define MSG_LIST_HIGHWAT 100
 
+#define MAX_RTP_LEN		1600
+
+
 /*protocal head and tail byte defined*/
 #define PROTOCAL_HEAD_BYTE	0xFAF5
 #define PROTOCAL_TAIL_BYTE	0xFAF6
@@ -140,11 +143,14 @@ typedef enum attributeType
 	//enVoReso = 0x13,	/*video resolution*/
 	enVoWidth = 0x13,	/*video width*/
 	enVoHeigth, 		/*video heigth*/
-	enVobit,		/*video bit rate*/
-	enVoFps,		/*video frame per second*/
-	enVoBrc ,  	/*Bit Rate Control*/
-	enAoType ,	/*audio encodec type*/
-	enStreamData
+	enVobit,			/*video bit rate*/
+	enVoFps,			/*video frame per second*/
+	enVoBrc ,  			/*Bit Rate Control*/
+	enAoType ,			/*audio encodec type*/
+	enStreamData,		/*video or audio stream data*/
+	enStreamType,		/*stream Type*/
+	enStreamPts,		/*stream pts*/
+	enVencBase64		/*video decodec message*/
 }EN_ATTR_TYPE;
 
 typedef enum commandRQ
@@ -221,6 +227,7 @@ typedef struct deviceInformation
 	uint32 			u32VideoFps;
 	EN_VIDEO_BRC	enVbrc;
 	EN_AENC_TYPE	enAencType;
+	sint8 			Base64[MAX_BASE64_LEN];
 	
 	EN_DEV_STAT 	enDevStat;
 }ST_DEV_INFO;
@@ -239,37 +246,105 @@ typedef struct FrameIndex
 	sint32 			frameType;		/* 当前包的类型 */
 	uint32			len;			/* 当前包的长度 */
 	uint32			offset;			/* 当前包数据的起始地址 */
+	uint32			pts;			/* 时间戳 */
 	time_t			wTime; 			/* 写入时间 */
 }ST_FRAME_INDEX;
 
 typedef struct RingBuffer
 {
-	sint32			bIsFull;				/* 满标志 */
-	uint32 			u32MaxLen;				/* 最大容量 */
+	bool			bHaveNoDataflag; 
+	sint32			bIsFull;			/* 满标志 */
+	uint32 			u32MaxLen;			/* 最大容量 */
 	uint32			u32LeftLen;			/* 剩余容量 */
-	uint32			u32HeadIndex;			/* 指向ringBuf头的索引 */
-	uint32 			u32CurIndex; 			/* 当前操作的索引 */
-	uint32			u32OldIndex; 			/* 最旧的索引 */
-	uint32			u32CurPos;				/* 当前位置 */
-	uint32			u32CurPlayIndex;		/*接下来需要播放的索引*/
+	uint32			u32HeadIndex;		/* 指向ringBuf头的索引 */
+	uint32 			u32CurIndex; 		/* 当前操作的索引 */
+	uint32			u32OldIndex; 		/* 最旧的索引 */
+	uint32			u32NewIndex;		/* 最新的索引 */
+	uint32			u32CurPos;			/* 当前位置 */
+	uint32			u32CurPlayIndex;	/*接下来需要播放的索引*/
 	sint8			*strBuf;			/* 数据指针 */
 
-	pthread_mutex_t	muxWriteLock;
+	pthread_mutex_t		muxLock;
+	pthread_cond_t		condRW;
 	ST_FRAME_INDEX	stIndex[MAX_INDEX];	/* 索引 */	
 }ST_RING_BUF;
+
+typedef enum RtpStreamType
+{
+	RTP_STREAM_VIDEO = 0,
+	RTP_STREAM_AUDIO,
+	RTP_STREAM_METADATA,
+	RTP_STREAM_MAX
+}EN_RTPSTREAM_TYPE;
+
+typedef enum RtpTransportType
+{
+	RTP_TRANSPORT_TYPE_UDP, 
+	RTP_TRANSPORT_TYPE_TCP, 
+	RTP_TRANSPORT_TYPE_BUTT
+}EN_RTPTRANSPORT_TYPE;
+
+typedef struct RtpTcpTicket
+{
+	uint32		rtp;
+	uint32		rtcp;
+}ST_RTPTCPTICKET;
+
+typedef enum VodSessionState
+{
+	RTSP_STATE_INIT		= 0,
+	RTSP_STATE_READY,
+	RTSP_STATE_PLAY,
+	RTSP_STATE_STOP,
+	RTSP_TCP_EXIT,
+	RTSP_STATE_BUTT
+}EN_VODSESSION_STATE;
+
+typedef struct RtpTcpSender_s{
+	ST_RTPTCPTICKET 	interleaved[RTP_STREAM_MAX];
+	uint32		audioG726Ssrc;
+	uint32		audioG711Ssrc;
+	uint32		videoH264Ssrc;
+	uint32      metadataSsrc;
+	uint16      metadataSeq;
+	uint16		lastSn;
+	uint16		AudioSeq;
+	uint16		lastTs;
+	sint32		channel;
+	sint32		tcpSockFd;
+	uint8		sendBuf[MAX_RTP_LEN];
+	uint32		sendLen;
+	bool		bFirstSendFlag;
+	uint32		u32SendIndex;
+}ST_RTPTCP_SENDER;
 
 typedef struct rtspSession
 {
 	sint8	userAgent[128];
+	sint8	range[64];
 	sint8	hostIp[64];
+	sint8	remoteIp[64];
+	sint32	remotePort;
 	
 	sint32	clientType;
 	sint32	s32LastSendReq;
 	uint32	u32LastSendSeq;	
 	uint32	u32LastRecvSeq;
 
+	bool	reqStreamFlag[RTP_STREAM_MAX];
+	bool	setupFlag[3];
+	sint8	sessId[16];
+
+	sint32	remoteRtpPort[RTP_STREAM_MAX];
+	sint32	remoteRtcpPort[RTP_STREAM_MAX];
+
+	ST_RTPTCPTICKET			interleaved[RTP_STREAM_MAX];
+	EN_RTPTRANSPORT_TYPE	transportType;
+	EN_VODSESSION_STATE		sessStat;
+
+	ST_RTPTCP_SENDER		*pstRtpSender;
 	void 	*pstDevSession;
-	
+	struct event evSendDataEvent;
 }ST_RTSP_SESSION;
 
 typedef struct
@@ -330,7 +405,7 @@ typedef struct connectInformation
 
 	ST_RING_BUF 	*pstRingBuf; 
 	ST_DEV_INFO 	*pstDevInfo;
-	ST_RTSP_SESSION *pRtspSess;
+	ST_RTSP_SESSION *pstRtspSess;
 
 	struct connectInformation		*pstConnNext;
 	ST_LIBEVENT_THREAD	*pstThread;

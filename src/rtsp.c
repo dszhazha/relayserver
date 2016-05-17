@@ -15,15 +15,382 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <errno.h>
 
 #include "server.h"
 #include "rtsp.h"
+#include "rtp.h"
 #include "md5.h"
 
 /*extern function*/
 extern int WBUFFER_AddMsghdr(ST_CONN_INFO *c);
+extern void CONN_SocketClose(ST_CONN_INFO *c) ;
 extern void CONN_SetState(ST_CONN_INFO *pstConnInfo, EN_CONN_STAT enState);
 extern ST_CONN_INFO *CONN_CheckMapConnect(sint8 *name, sint8 *passwd);
+extern sint32 CONN_CheckStreamStart(ST_CONN_INFO *c);
+extern sint32 CONN_CheckStreamStop(ST_CONN_INFO *c);
+
+extern sint32 RINGBUF_GetOnePacket(ST_RING_BUF *ab, uint32 u32index, sint8 **s8pkt);
+extern sint32 RINGBUF_GetCurPacketLen(ST_RING_BUF *ab, uint32 u32index);
+extern sint32 RINGBUF_GetNewIndex(ST_RING_BUF *ab);
+extern sint32 RINGBUF_GetCurNalType(ST_RING_BUF *ab, uint32 index);
+extern sint32 RINGBUF_GetCurPktPts(ST_RING_BUF *ab, uint32 index);
+extern sint32 RINGBUF_CheckTimeout(ST_RING_BUF *ab, uint32 sendIndex, uint32 newIndex);
+extern void RINGBUF_IndexCount(ST_RING_BUF *ab, uint32 *index);
+
+int RTP_TcpPacket(ST_RTPTCP_SENDER *pSender, EN_RTP_PT payloadType, uint32 pts,
+									 sint32 marker, sint32 len, sint8 *data)
+{
+	RtpHdr_t *pRtpHdr = NULL;
+	unsigned short *intlvd_ch = (unsigned short *)(pSender->sendBuf+2);
+ 
+	pSender->sendLen = 0;
+	pRtpHdr = (RtpHdr_t *)(pSender->sendBuf + 4);
+	RTP_HDR_SET_VERSION(pRtpHdr, RTP_VERSION);
+	RTP_HDR_SET_P(pRtpHdr, 0);
+	RTP_HDR_SET_X(pRtpHdr, 0);
+	RTP_HDR_SET_CC(pRtpHdr, 0);
+	RTP_HDR_SET_M(pRtpHdr, marker);
+	RTP_HDR_SET_PT(pRtpHdr, payloadType);
+	if( payloadType == RTP_PT_ALAW || RTP_PT_ULAW == payloadType || 
+		RTP_PT_G726 == payloadType||RTP_PT_AAC == payloadType)
+	{
+		RTP_HDR_SET_SEQNO(pRtpHdr, htons(pSender->AudioSeq));
+		RTP_HDR_SET_SSRC(pRtpHdr, htonl(pSender->audioG711Ssrc));
+		pSender->AudioSeq ++;
+	}
+	else if(RTP_PT_METADATA== payloadType)
+	{
+		RTP_HDR_SET_SEQNO(pRtpHdr, htons(pSender->metadataSeq));
+		RTP_HDR_SET_SSRC(pRtpHdr, htonl(pSender->metadataSsrc));
+		pSender->metadataSeq ++;
+	}
+	else
+	{
+		RTP_HDR_SET_SEQNO(pRtpHdr, htons(pSender->lastSn));
+		RTP_HDR_SET_SSRC(pRtpHdr, htonl(pSender->videoH264Ssrc));
+		pSender->lastSn ++;
+	}
+	RTP_HDR_SET_TS(pRtpHdr, htonl(pts));
+ 
+	pSender->lastTs = pts;
+ 
+	//#ifndef __one_copy__
+	//memcpy(pSender->sendBuf + RTP_HDR_LEN + 4 , data, len);
+	//#endif 
+	pSender->sendLen = RTP_HDR_LEN + len;
+ 
+	pSender->sendBuf[0] = '$';
+	if((payloadType == RTP_PT_H264)
+			|| (payloadType == RTP_PT_MPEG4)
+			|| (payloadType == RTP_PT_JPEG)){//fixed by xsf
+			pSender->sendBuf[1] = pSender->interleaved[RTP_STREAM_VIDEO].rtp;
+	 }
+	else if(payloadType == RTP_PT_METADATA)
+	{
+		pSender->sendBuf[1] = pSender->interleaved[RTP_STREAM_METADATA].rtp;
+	}
+	else
+	{
+		pSender->sendBuf[1] = pSender->interleaved[RTP_STREAM_AUDIO].rtp;
+	}
+	*intlvd_ch = htons((unsigned short) pSender->sendLen);
+ 
+	return SUCCESS;
+}
+
+static sint32 RTSP_CreateSender(ST_CONN_INFO *c)
+{
+	c->pstRtspSess->pstRtpSender = (ST_RTPTCP_SENDER *)calloc(1, sizeof(ST_RTPTCP_SENDER));
+	if (c->pstRtspSess->pstRtpSender == NULL) 
+	{
+		LOG_FUNC(Err, True, "Failed to allocate rtp session\n");
+		return FAIL;
+	}
+
+	c->pstRtspSess->pstRtpSender->interleaved[RTP_STREAM_VIDEO].rtp =
+							c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtp;
+	c->pstRtspSess->pstRtpSender->interleaved[RTP_STREAM_VIDEO].rtcp =
+							c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtcp;
+	c->pstRtspSess->pstRtpSender->interleaved[RTP_STREAM_AUDIO].rtp =
+							c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtp;
+	c->pstRtspSess->pstRtpSender->interleaved[RTP_STREAM_AUDIO].rtcp =
+							c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtcp;
+	//metadata
+	c->pstRtspSess->pstRtpSender->interleaved[RTP_STREAM_METADATA].rtp =
+							c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtp;
+	c->pstRtspSess->pstRtpSender->interleaved[RTP_STREAM_METADATA].rtcp =
+							c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtcp;
+	c->pstRtspSess->pstRtpSender->tcpSockFd = c->s32Sockfd;
+	c->pstRtspSess->pstRtpSender->lastTs 	= 3600;
+	c->pstRtspSess->pstRtpSender->AudioSeq 	= 1200;
+	c->pstRtspSess->pstRtpSender->metadataSeq= 2400;
+	c->pstRtspSess->pstRtpSender->lastSn	= 3600;
+	c->pstRtspSess->pstRtpSender->metadataSsrc = RTP_DEFAULT_SSRC + 256;
+	c->pstRtspSess->pstRtpSender->audioG711Ssrc = RTP_DEFAULT_SSRC + 128;
+	c->pstRtspSess->pstRtpSender->videoH264Ssrc = RTP_DEFAULT_SSRC;
+	c->pstRtspSess->pstRtpSender->bFirstSendFlag = True;
+	return SUCCESS;
+}
+
+static void RTSP_FreeSender(ST_CONN_INFO *c)
+{
+	if(c->pstRtspSess->pstRtpSender != NULL)
+		free(c->pstRtspSess->pstRtpSender);
+}
+
+sint32 RTP_FrameTcpSendN(sint32 sockFd, sint8 *buf, sint32 size)
+{
+	sint32 n,left;
+	sint8 *pBuf;
+	
+	n = 0;
+	left = size;
+	pBuf = (char *)buf;
+	while(left > 0)
+	{
+		n = send(sockFd, pBuf, left, MSG_NOSIGNAL);
+		if (n <= 0)
+		{
+			/* EINTR A signal occurred before any data was transmitted. */
+			if(errno == EINTR)
+			{
+				n = 0;
+				LOG_FUNC(Err, False, "socket send_n eintr error");
+			}
+			else
+			{
+				LOG_FUNC(Err, False, "socket error");
+				return(-1);
+			}
+		}
+		left -= n;
+		pBuf += n;
+	}
+	return size;
+}
+
+
+sint32 RTP_TcpSend(ST_CONN_INFO *c, sint32 type)
+{
+	sint32 	ret = 0;
+
+	if(c->s32Sockfd > 0)
+	{
+		ret = RTP_FrameTcpSendN(c->s32Sockfd, (char *)c->pstRtspSess->pstRtpSender->sendBuf,
+												c->pstRtspSess->pstRtpSender->sendLen +4);
+		/*sendBuf[0] = '$'
+	          sendBuf[1] = interleaved
+	          sendBuf[2~3] = sendLen
+	          sendBuf[4~] = data  */
+		if(ret == c->pstRtspSess->pstRtpSender->sendLen + 4 )
+		{
+			return SUCCESS;
+		}
+	}
+	LOG_FUNC(Err, False, "send %d, sendLen = %d , sockfd = %d\n",
+					ret, c->pstRtspSess->pstRtpSender->sendLen, c->pstRtspSess->pstRtpSender->tcpSockFd);
+	return FAIL;
+}
+
+static sint32 RTSP_SendStream(ST_CONN_INFO *c)
+{
+	assert(c->enConnType == enConnPlayer);
+	sint8 	*pstrData = NULL;
+	sint8 	*pSend = NULL;
+	sint8 	*pBuf = NULL; 
+	sint32 	pktLen = 0, syncIndex, type, dataLen, nalType;
+	sint32	leftLen, pos;
+	uint8 	sToken;
+	uint32 	pts;
+	ST_CONN_INFO *pds = (ST_CONN_INFO *)c->pstRtspSess->pstDevSession;
+	
+	if(pds->pstDevInfo->enDevStat == enDevTransfStream) //transfer stream data
+	{
+		if(c->pstRtspSess->pstRtpSender->bFirstSendFlag == True)
+		{
+			c->pstRtspSess->pstRtpSender->u32SendIndex = 
+				RINGBUF_GetNewIndex(pds->pstRingBuf);
+			pktLen = RINGBUF_GetCurPacketLen(pds->pstRingBuf, 
+					c->pstRtspSess->pstRtpSender->u32SendIndex);
+			if(pktLen <= 0)
+			{
+				usleep(1000);
+				LOG_FUNC(Info, False, "find sps ,index = %d,len=%d\n", 
+					c->pstRtspSess->pstRtpSender->u32SendIndex, pktLen);
+				return SUCCESS;
+			}
+			else if(NAL_TYPE_SPS == RINGBUF_GetCurNalType(pds->pstRingBuf, 
+					c->pstRtspSess->pstRtpSender->u32SendIndex))
+			{
+				c->pstRtspSess->pstRtpSender->bFirstSendFlag = False;
+			}
+			else
+			{
+				RINGBUF_IndexCount(pds->pstRingBuf, 
+					&c->pstRtspSess->pstRtpSender->u32SendIndex);
+				return SUCCESS;
+			}		
+		}
+
+		pktLen = RINGBUF_GetOnePacket(pds->pstRingBuf, 
+			c->pstRtspSess->pstRtpSender->u32SendIndex, &pstrData);
+		/*send too fast*/
+		while(pktLen <= 0)
+		{
+			if(RTSP_STATE_PLAY != c->pstRtspSess->sessStat)
+			{
+				LOG_FUNC(Err, False, "pSess stat is not play \n");
+				return FAIL;
+			}
+			c->pstRtspSess->pstRtpSender->u32SendIndex = 
+				RINGBUF_GetNewIndex(pds->pstRingBuf);
+				
+			pktLen = RINGBUF_GetOnePacket(pds->pstRingBuf, 
+					c->pstRtspSess->pstRtpSender->u32SendIndex, &pstrData);
+			LOG_FUNC(Err, False, "too fast , len = %d\n", pktLen);
+			usleep(1000);
+		}
+
+		syncIndex = RINGBUF_GetNewIndex(pds->pstRingBuf);
+		/*send too slow*/
+		if(True == RINGBUF_CheckTimeout(pds->pstRingBuf, 
+			c->pstRtspSess->pstRtpSender->u32SendIndex, syncIndex))
+		{
+			c->pstRtspSess->pstRtpSender->u32SendIndex = 
+				RINGBUF_GetNewIndex(pds->pstRingBuf);
+			LOG_FUNC(Err, False, "too slow len = %d\n", pktLen);
+			return FAIL;
+		}
+		
+		pBuf = (sint8 *)(c->pstRtspSess->pstRtpSender->sendBuf+RTP_HDR_LEN+4);
+		type = RINGBUF_GetCurNalType(pds->pstRingBuf, c->pstRtspSess->pstRtpSender->u32SendIndex);
+		pts = RINGBUF_GetCurPktPts(pds->pstRingBuf, c->pstRtspSess->pstRtpSender->u32SendIndex);
+		
+		if((type == AUDIO_TYPE)||(type == AUDIO_AAC_TYPE))
+		{
+			if(c->pstRtspSess->reqStreamFlag[1] == True)
+			{
+				printf("send audio data\n");
+				memcpy(pBuf, pstrData, pktLen);
+				RTP_TcpPacket(c->pstRtspSess->pstRtpSender, type, pts, 1, pktLen, pstrData);
+				if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_AUDIO))
+				{
+					LOG_FUNC(Err, False, "RTP_TcpSend error\n");
+					return FAIL;
+				}
+			}
+		}
+		else
+		{
+			if(c->pstRtspSess->reqStreamFlag[0] == True)
+			{
+				printf("send video data\n");
+				pSend  	= pstrData + H264_STARTCODE_LEN;
+				dataLen = pktLen - H264_STARTCODE_LEN;
+				nalType = H264_Get_NalType(*pSend);
+				/* 长度小于1024不需要分包 */
+				if(dataLen <= NAL_FRAGMENTATION_SIZE)
+				{
+					memcpy(pBuf, pSend, dataLen);
+					RTP_TcpPacket(c->pstRtspSess->pstRtpSender, RTP_PT_H264, pts, 1, dataLen, pSend);
+					if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_VIDEO))
+					{
+						LOG_FUNC(Err, False, "RTP_TcpSend error\n");
+						return FAIL;
+					}
+				}
+				else
+				{
+					/* 长度大于1024则进行 FU-A 分包 */
+					pBuf[0] = 0x1c | (*pSend & (~0x1f));
+					leftLen = dataLen;
+					sToken  = 1;
+					pos     = 0;
+					while(leftLen > NAL_FRAGMENTATION_SIZE)
+					{
+						if(RTSP_STATE_PLAY != c->pstRtspSess->sessStat)
+						{
+							LOG_FUNC(Err, False, "pSess stat is not play \n");
+							return FAIL;
+						}
+	
+						pBuf[1] = (sToken << 7) | nalType;
+						memcpy(pBuf+2, pSend+pos+sToken, NAL_FRAGMENTATION_SIZE - sToken);
+						
+						RTP_TcpPacket(c->pstRtspSess->pstRtpSender, RTP_PT_H264, pts, 0,
+							NAL_FRAGMENTATION_SIZE + 2 - sToken, NULL);
+						if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_VIDEO))
+						{
+							LOG_FUNC(Err, False, "RTP_TcpSend error\n");
+							return FAIL;
+						}
+						sToken 	= 0;
+						leftLen -= NAL_FRAGMENTATION_SIZE;
+						pos 	+= NAL_FRAGMENTATION_SIZE;
+					}
+					
+					if(sToken)
+					{
+						nalType |= 128;
+					}
+					
+					pBuf[1] = 64 | nalType;
+					memcpy(pBuf+2, pSend+pos+sToken, leftLen-sToken);
+					RTP_TcpPacket(c->pstRtspSess->pstRtpSender, RTP_PT_H264, pts, 1,
+														leftLen+2-sToken, NULL);
+					if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_VIDEO))
+					{
+						LOG_FUNC(Err, False, "RTP_TcpSend error\n");
+						return FAIL;
+					}
+				}
+			}
+		}
+		RINGBUF_IndexCount(pds->pstRingBuf, &c->pstRtspSess->pstRtpSender->u32SendIndex);
+	}
+
+	return SUCCESS;
+}
+
+void RTSP_SendStreamHandler(const sint32 fd, const sint16 which, void *arg) 
+{
+    ST_CONN_INFO *c;
+
+    c = (ST_CONN_INFO *)arg;
+    assert(c != NULL);
+
+    /* sanity */
+    if (fd != c->s32Sockfd)
+	{
+        if (gstSettings.bVerbose)
+            LOG_FUNC(Debug, False, "Catastrophic: event fd doesn't match conn fd!\n");
+        CONN_SocketClose(c);
+        return;
+    }
+
+    RTSP_SendStream(c);
+	
+    /* wait for next event */
+    return;
+}
+
+sint32 RTSP_AddSendStreamTsk(ST_CONN_INFO *c) 
+{
+    assert(c != NULL);
+
+    struct event_base *base = c->evConnEvent.ev_base;
+    event_del(&c->pstRtspSess->evSendDataEvent);
+    event_set(&c->pstRtspSess->evSendDataEvent, c->s32Sockfd, EV_WRITE | EV_PERSIST,
+		RTSP_SendStreamHandler, (void *)c);
+    event_base_set(base, &c->pstRtspSess->evSendDataEvent);
+    if (event_add(&c->pstRtspSess->evSendDataEvent, 0) == -1) 
+		return FAIL;
+
+	c->pstRtspSess->sessStat = RTSP_STATE_PLAY;
+    return SUCCESS;
+}
 
 /* clear recv and send buffer*/
 #define RTSP_CLEAR_SENDBUF(c)   \
@@ -210,7 +577,7 @@ sint32 RTSP_GetHead(sint32 err, ST_CONN_INFO *c)
     pTmp = c->wbuf;
     pTmp += sprintf(pTmp, "%s %d %s\r\n", RTSP_VERSION, err,
                     RTSP_GetMethodDescrib(err));
-    pTmp += sprintf(pTmp,"CSeq: %d\r\n", c->pRtspSess->u32LastRecvSeq);
+    pTmp += sprintf(pTmp,"CSeq: %d\r\n", c->pstRtspSess->u32LastRecvSeq);
     pTmp += sprintf(pTmp,"Server: "SRV_NAME" Rtsp Server "SRV_VER"\r\n");
 
     return (strlen(c->wbuf));
@@ -218,13 +585,14 @@ sint32 RTSP_GetHead(sint32 err, ST_CONN_INFO *c)
 
 void RTSP_GetMulticastPara(ST_MULTICAST_PARA *pmp)
 {
-    memcpy(pmp->multicast_ip, MULTICAST_IP, 9);
+    memcpy(pmp->multicast_ip, MULTICAST_IP, strlen(MULTICAST_IP));
     pmp->multicast_port = MULTICAST_PORT;
     pmp->multicast_ttl = MULTICAST_TTL;
 }
 
 sint32 RTSP_SendReply(sint32 err, sint32 simple, char *addon, ST_CONN_INFO *c)
-{
+{	
+	RTSP_CLEAR_SENDBUF(c);
     sint8 *pTmp = c->wbuf;
 
     if(simple == 1)
@@ -352,21 +720,31 @@ sint32 RTSP_PraseUserPwd(sint8 *buff, sint8 *name, sint8 *passwd)
 	p = strstr(buff, RTSP_USER);
 	if(p == NULL)
 	{
-		LOG_FUNC(Err, False, "Parse User error\n");
+		LOG_FUNC(Err, False, "Parse User start error\n");
 		return FAIL;
 	}
-	p+=1;
-	q = strchr(p, ' ');
+	p += (strlen(RTSP_USER)+1);
+	q = strchr(p, '+');
+	if(q == NULL || q-p >= NAME_LEN)
+	{
+		LOG_FUNC(Err, False, "Parse User end error\n");
+		return FAIL;
+	}
 	memcpy(name, p, q-p);
 
 	p = strstr(buff, RTSP_PWD);
 	if(p == NULL)
 	{
-		LOG_FUNC(Err, False, "Parse Pwd error\n");
+		LOG_FUNC(Err, False, "Parse Pwd start error\n");
 		return FAIL;
 	}
-	p+=1;
+	p += (strlen(RTSP_PWD)+1);
 	q = strchr(p, ' ');
+	if(q == NULL  || q-p >= NAME_LEN)
+	{
+		LOG_FUNC(Err, False, "Parse Pwd end error\n");
+		return FAIL;
+	}
 	memcpy(passwd, p, q-p);
 
 	return SUCCESS;
@@ -384,6 +762,130 @@ static sint32 RTSP_GetHostInfo(sint32 sockFd, sint8 *ipAddr)
 		return FAIL;
 	}
 	strncpy(ipAddr, (const char *)inet_ntoa(hostAddr.sin_addr), 64);
+	return SUCCESS;
+}
+
+static sint32 RTSP_GetPeerInfo(sint32 sockFd, sint8 *ipAddr, sint32 *port)
+{
+	socklen_t addrLen;
+	struct sockaddr_in cliAddr;
+
+	addrLen = sizeof(cliAddr);
+	if(-1 == getpeername(sockFd, (struct sockaddr *)&cliAddr, &addrLen))
+	{
+		LOG_FUNC(Err, False, "getpeername error \n");
+		return FAIL;
+	}
+	strncpy(ipAddr, (const char *)inet_ntoa(cliAddr.sin_addr), 64);
+	*port = (int)ntohs(cliAddr.sin_port);
+
+	return SUCCESS;
+}
+
+
+sint32 RTSP_GetChannel(const sint8*szChn)
+{
+	int chn = -1;
+
+	if(szChn == NULL)
+	{
+		return FAIL;
+	}
+	else
+	{
+		chn = atoi(szChn);
+	}
+	return chn;
+}
+
+sint32 RTSP_GetCurClientCnt(void)
+{
+	sint32 clients = 0;
+
+	return clients;
+}
+
+sint32 RTSP_CheckChn(sint32 chn)
+{
+	sint32 curClientCnt = 0;
+
+
+	if(chn<0 || chn> MAX_VOD_CHN){
+		return FAIL;
+	}
+
+	curClientCnt = RTSP_GetCurClientCnt();
+	if(curClientCnt >= MAX_CLIENTS)
+	{
+		LOG_FUNC(Err, False, "too more clients MAX[%d] > %d!! \n", curClientCnt, MAX_CLIENTS);
+		return FAIL;
+	}
+
+	return SUCCESS;
+}
+
+void RTSP_GetSessionId(sint8 *sessId, sint32 len)
+{
+	sint32 i;
+	for(i=0; i<len; i++){
+		sessId[i] = (char )((random()%10) + '0');
+	}
+	sessId[len] = 0;
+}
+
+sint32 RTSP_GetRange(sint8 *buf, sint8 *ntp_buf)
+{
+	char  *pTmp = NULL;
+
+	pTmp = strstr(buf, RTSP_HDR_RANGE);
+	if(pTmp == NULL)
+	{
+		return FAIL;
+	}
+	else
+	{
+		pTmp += 7;/*Range: */
+		if(1 != sscanf(pTmp, "%64s", ntp_buf))
+		{
+			return FAIL;
+		}
+	}
+	return SUCCESS;
+}
+
+sint32 RTSP_SessionCreate(ST_CONN_INFO *c)
+{
+	c->pstRtspSess = (ST_RTSP_SESSION *)calloc(1, sizeof(ST_RTSP_SESSION));
+	if (c->pstRtspSess == NULL) 
+	{
+		LOG_FUNC(Err, True, "Failed to allocate rtsp session\n");
+		return FAIL;
+	}
+
+	c->pstRtspSess->setupFlag[0] = 0;
+	c->pstRtspSess->setupFlag[1] = 0;
+	c->pstRtspSess->setupFlag[2] = 0;
+
+	RTSP_GetSessionId(c->pstRtspSess->sessId, 8);
+
+	c->pstRtspSess->sessStat = RTSP_STATE_INIT;
+
+	if( SUCCESS != RTSP_GetPeerInfo(c->s32Sockfd, c->pstRtspSess->remoteIp, &c->pstRtspSess->remotePort))
+	{
+		LOG_FUNC(Err, False, "RTSP_GetPeerInfo error\n ");
+		free(c->pstRtspSess);
+		c->pstRtspSess = NULL;
+		return FAIL;
+	}
+
+	if(SUCCESS != RTSP_GetHostInfo(c->s32Sockfd, c->pstRtspSess->hostIp))
+	{
+   		LOG_FUNC(Err, False, "RTSP_GetHostInfo error!\n");
+		free(c->pstRtspSess);
+		c->pstRtspSess = NULL;
+		return FAIL;
+	}
+
 	return SUCCESS;
 }
 
@@ -412,20 +914,21 @@ sint32 RTSP_EventHandleOptions(ST_CONN_INFO *c)
 
 sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 {
-	sint32  port;
+	sint32  port, chn=0;
 	sint8 	server[128]={0};
     sint8   url[256]= {0};
-	sint8 	szChn[16]={0};
+	sint8 	szChn[255]={0};
 	sint8 	user[NAME_LEN]={0};
 	sint8 	pwd[NAME_LEN]={0};
 	
 	sint8 	*pTmp = NULL;
 	sint8 	*p = NULL;
+	sint8 	*pSdp = NULL;
 	
-    MD5_CTX     md5p;
+    //MD5_CTX     md5p;
     ST_MULTICAST_PARA   stMulticastPara;
     memset(&stMulticastPara, 0x0, sizeof(ST_MULTICAST_PARA));
-    memset(&md5p, 0x0, sizeof(MD5_CTX));
+    //memset(&md5p, 0x0, sizeof(MD5_CTX));
 
     RTSP_GetMulticastPara(&stMulticastPara);
 
@@ -433,23 +936,31 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
     {
         RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
         LOG_FUNC(Err, False, "sscanf url error \n");
-        return FAIL;
+        return RTSP_STATUS_BAD_REQUEST;
     }
 
 	if(SUCCESS != RTSP_ParseUrl(&port, server, szChn, url))
 	{
-		LOG_FUNC(Err, False, "url is not found !\n");
+		LOG_FUNC(Err, False, "RTSP_ParseUrl error\n");
 		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
-		return FAIL;
+		return RTSP_STATUS_BAD_REQUEST;
 	}
 
+	chn = RTSP_GetChannel(szChn);
+	if(chn == FAIL)
+	{
+		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
+		LOG_FUNC(Err, False, "RTSP_GetChannel error\n");
+		return RTSP_STATUS_BAD_REQUEST;
+	}
+	
 	if(NULL != strstr(c->rbuf, RTSP_HDR_ACCEPT))
 	{
 		if(NULL == strstr(c->rbuf, RTSP_SDP))
 		{
 			LOG_FUNC(Err, False, "only accept require. \n");
 			RTSP_SendReply(551, 1, NULL, c);
-			return FAIL;
+			return 551;
 		}
 	}
 
@@ -472,46 +983,47 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 		}
 		if(p != pTmp)
 		{
-			strncpy(c->pRtspSess->userAgent, pTmp, p - pTmp);
+			strncpy(c->pstRtspSess->userAgent, pTmp, p - pTmp);
 		}
 	}
 
 	pTmp = strstr(c->rbuf, "Ecsino");
 	if(pTmp)
 	{
-		c->pRtspSess->clientType = enClientTypeEcsion;
+		c->pstRtspSess->clientType = enClientTypeEcsion;
 	}
 	else
 	{
-		c->pRtspSess->clientType = enClientTypeUndefined;
+		c->pstRtspSess->clientType = enClientTypeUndefined;
 	}
 
 	if(SUCCESS != RTSP_PraseUserPwd(c->rbuf, user, pwd))
 	{
-		LOG_FUNC(Err, False, "url is not found !\n");
+		LOG_FUNC(Err, False, "RTSP_PraseUserPwd error\n");
 		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
-		return FAIL;
+		return RTSP_STATUS_BAD_REQUEST;
 	}
 	
-	c->pRtspSess->pstDevSession = CONN_CheckMapConnect(user, pwd);
-	if(c->pRtspSess->pstDevSession == NULL)
+	c->pstRtspSess->pstDevSession = CONN_CheckMapConnect(user, pwd);
+	if (c->pstRtspSess->pstDevSession == NULL)
 	{
-		LOG_FUNC(Err, False, "device name found !\n");
+		LOG_FUNC(Err, False, "device name not found !\n");
 		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
-		return FAIL;
+		return RTSP_STATUS_BAD_REQUEST;
 	}
+	ST_CONN_INFO *pds = (ST_CONN_INFO *)c->pstRtspSess->pstDevSession;
 
-	if(SUCCESS != RTSP_GetHostInfo(c->s32Sockfd, c->pRtspSess->hostIp))
+	if(SUCCESS != CONN_CheckStreamStart(pds))
 	{
-   		LOG_FUNC(Err, False, "RTSP_GetHostInfo error!\n");
-		return FAIL;
+		LOG_FUNC(Err, False, "CONN_CheckStreamStart error\n");
+		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
+		return RTSP_STATUS_BAD_REQUEST;
 	}
-
-	ST_CONN_INFO *pds = (ST_CONN_INFO *)c->pRtspSess->pstDevSession;
+	
 	RTSP_CLEAR_SENDBUF(c);
 	pTmp = c->wbuf;
 	pTmp += sprintf(pTmp, "%s %d %s\r\n", RTSP_VERSION, 200, RTSP_GetMethodDescrib(200));
-	pTmp += sprintf(pTmp, "Cseq: %d \r\n", c->pRtspSess->u32LastRecvSeq);
+	pTmp += sprintf(pTmp, "Cseq: %d \r\n", c->pstRtspSess->u32LastRecvSeq);
 
 	/*width * heigth * rate * resolution */
 	pTmp += sprintf(pTmp, 
@@ -524,11 +1036,19 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 
 	pTmp += sprintf(pTmp, "Content-Type: application/sdp\r\n");
 
+	pSdp = (sint8 *)calloc(4096 , sizeof(char));
+	if(pSdp == NULL)
+	{
+		LOG_FUNC(Err, False, "calloc pSdp error \n");
+		return FAIL;
+	}
+	
+	p = pSdp;
 	p += sprintf(p,"v=0\r\n");
-    p += sprintf(p,"o=StreamingServer 3331435948 1116907222000 IN IP4 %s\r\n", c->pRtspSess->hostIp);
+    p += sprintf(p,"o=StreamingServer 3331435948 1116907222000 IN IP4 %s\r\n", c->pstRtspSess->hostIp);
     p += sprintf(p,"s=h264.mp4\r\n");
 	
-	if(0==strcmp(stMulticastPara.multicast_ip,"0.0.0.0"))
+	if(0==strcmp(stMulticastPara.multicast_ip, "0.0.0.0"))
     	p += sprintf(p,"c=IN IP4 0.0.0.0\r\n");
 	else	
 		/*read db or config ,otherwise defalu 0.0.0.0*/
@@ -544,7 +1064,7 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 		    p += sprintf(p,"a=control:trackID=0\r\n");
 		    p += sprintf(p,"a=rtpmap:96 H264/90000\r\n");
 			p += sprintf(p,"a=fmtp:96 packetization-mode=1; "
-				"sprop-parameter-sets=%s\r\n", (char *)RTSP_Media_Para_GetBase64(ch));//加密
+				"sprop-parameter-sets=%s\r\n", pds->pstDevInfo->Base64);//加密
 			break;
 		case enVencMJPEG:
 			p += sprintf(p,"m=video 0 RTP/AVP 26\r\n");
@@ -556,51 +1076,401 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 		    p += sprintf(p,"a=control:trackID=0\r\n");
 		    p += sprintf(p,"a=rtpmap:96 H264/90000\r\n");
 			p += sprintf(p,"a=fmtp:96 packetization-mode=1; "
-				"sprop-parameter-sets=%s\r\n", (char *)RTSP_Media_Para_GetBase64(ch));//加密
+				"sprop-parameter-sets=%s\r\n", pds->pstDevInfo->Base64);//加密
 			break;
 	}
 
+	/* RTP/AVP 97 --> G726  */
+	/* RTP/AVP 8  --> G711-A */
+	/* RTP/AVP 0  --> G711-U */
+	switch(pds->pstDevInfo->enAencType)
+	{
+		case enAencPcmu:
+			/* G711-U */
+			p += sprintf(p,"m=audio 0 RTP/AVP 0\r\n");
+		    p += sprintf(p,"a=control:trackID=1\r\n");
+			p += sprintf(p,"a=rtpmap:0 PCMU/8000\r\n");
+			break;
+		case enAencPcma:
+			/* G711-A */
+		    p += sprintf(p,"m=audio 0 RTP/AVP 8\r\n");
+		    p += sprintf(p,"a=control:trackID=1\r\n");
+			p += sprintf(p,"a=rtpmap:8 PCMA/8000\r\n");
+			break;
+		case enAencFaac:
+			/* AAC  */
+			p += sprintf(p,"m=audio 21070 RTP/AVP 108\r\n");
+			p += sprintf(p,"a=control:trackID=1\r\n");
+			p += sprintf(p,"a=rtpmap:108 mpeg4-generic/16000/2\r\n");
+			p += sprintf(p,"a=fmtp:108 streamtype=5; profile-level-id=15; mode=AAC-hbr; config=1410; SizeLength=13; IndexLength=3; IndexDeltaLength=3; Profile=1;\r\n");
+			break;
+	}
 	
+	/* metadata streamy */
+	/* RTP/AVP 107 */
+	p += sprintf(p,"m=application 0 RTP/AVP 107\r\n");
+	p += sprintf(p,"a=control:trackID=2\r\n");
+	p += sprintf(p,"a=rtpmap:107 vnd.onvif.metadata/90000\r\n\r\n");
+
+	pTmp += sprintf(pTmp,"Content-length: %d\r\n", strlen(pSdp));
+    pTmp += sprintf(pTmp,"Content-Base: rtsp://%s/%d/\r\n\r\n", c->pstRtspSess->hostIp, chn);
+
+	strcat(pTmp, pSdp);
 	
+	if(pSdp != NULL)
+	{
+		free(pSdp);
+		pSdp = NULL;
+	}
+
+	c->wcurr = c->wbuf;
+    c->wbytes = strlen(c->wbuf);
+
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    WBUFFER_AddMsghdr(c);
+
+    RTSP_CLEAR_RECVBUF(c);
+    CONN_SetState(c, enConnWrite);
+    return SUCCESS; 
+	
+}
+
+sint32 RTSP_EventHandleSetup(ST_CONN_INFO *c)
+{
+	sint8   url[256]= {0};
+	sint8 	server[128]={0}, obj[255]={0}, trash[255]={0}, line[255]={0};
+	sint32 	svrPort = 0, trackId = 0, chn = 0;
+
+	sint8 	*p = NULL, *pTmp = NULL;
+	
+	ST_MULTICAST_PARA	stMulticastPara;
+	memset(&stMulticastPara, 0x0, sizeof(ST_MULTICAST_PARA));
+	
+	RTSP_GetMulticastPara(&stMulticastPara);
+
+	if(!sscanf(c->rbuf, " %*s %254s ", url))
+	{
+		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
+		LOG_FUNC(Err, False, "sscanf url error \n");
+		return RTSP_STATUS_BAD_REQUEST;
+	}
+	
+	if(SUCCESS != RTSP_ParseUrl(&svrPort, server, obj, url))
+	{
+		LOG_FUNC(Err, False, "RTSP_ParseUrl error\n");
+		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
+		return RTSP_STATUS_BAD_REQUEST;
+	}
+
+	p = strstr(obj, "trackID");
+	if(p == NULL)
+	{
+		LOG_FUNC(Err, False, "no track id. \n");
+		RTSP_SendReply(406, 1, "Require: Transport settings "
+								"of rtp/udp;port=nnnn. ", c);
+		return 406;
+	}
+
+	sscanf(p, "%8s%d", trash, &trackId);
+	sscanf(obj, "%d/%s", &chn, trash);
+	
+	if(FAIL == RTSP_CheckChn(chn))
+	{
+		LOG_FUNC(Err, False, "chn = %d, error \n", chn);
+		RTSP_SendReply(400, 1, NULL, c);
+		return 400;
+	}
+
+	if(chn > 0)
+	{
+		chn = 1;
+	}
+
+	p = strstr(c->rbuf, RTSP_HDR_TRANSPORT);
+	if(p == NULL)
+	{
+		LOG_FUNC(Err, False, "get rtp transport type  error \n");
+		RTSP_SendReply(406, 1, "Require: Transport settings"
+										" of rtp/udp;port=nnnn. ", c);
+		return 406;
+	}
+
+	if(trackId == TRACK_ID_VIDEO)
+	{
+		c->pstRtspSess->reqStreamFlag[RTP_STREAM_VIDEO] = True;
+	}
+	else if(trackId == TRACK_ID_AUDIO)
+	{
+		c->pstRtspSess->reqStreamFlag[RTP_STREAM_AUDIO] = True;
+	}
+	else if(trackId == TRACK_ID_METADATA)
+	{
+		c->pstRtspSess->reqStreamFlag[RTP_STREAM_METADATA] = True;
+	}
+	else
+	{
+		LOG_FUNC(Err, False, "track id = %d error \n", trackId);
+		RTSP_SendReply(400, 1, NULL, c);
+		return 400;
+	}
+
+	/*
+	 * Transport: RTP/AVP;unicast;client_port=6972-6973;source=10.71.147.222;
+	 * 		   server_port=6970-6971;ssrc=00003654
+	 * trash = "Transport:"
+	 * line = "RTP/AVP;unicast;client_port=6972-6973;source=10.71.147.222;
+	 *         server_port=6970-6971;ssrc=00003654"
+	 */
+
+	if(2 != sscanf(p, "%10s%255s", trash, line))
+	{
+		LOG_FUNC(Err, False, "setup request malformed \n");
+		RTSP_SendReply(400, 1, 0, c);
+		return 400;
+	}
+
+	p = strstr(line, "RTP/AVP/TCP");
+	if(p != NULL)
+	{
+		//check multicast param
+		if((0!=strcmp(stMulticastPara.multicast_ip,"0.0.0.0"))
+			||(stMulticastPara.multicast_port!= 0)
+			||(stMulticastPara.multicast_ttl !=0))
+		{
+			memset(&stMulticastPara.multicast_ip,0,32);
+			memcpy(stMulticastPara.multicast_ip,"0.0.0.0",7);
+			stMulticastPara.multicast_port = 0;
+			stMulticastPara.multicast_ttl = 0;
+		}		
+		
+		c->pstRtspSess->transportType = RTP_TRANSPORT_TYPE_TCP;
+		RTSP_CLEAR_SENDBUF(c);
+		pTmp = c->wbuf;
+		pTmp += RTSP_GetHead(200, c);
+		pTmp += sprintf(pTmp,"Session: %s;timeout=120\r\n", c->pstRtspSess->sessId);
+
+		p = strstr(line, "interleaved");
+		if(p != NULL)
+		{	
+			if(trackId == TRACK_ID_VIDEO)
+			{
+				if(c->pstRtspSess->setupFlag[0] == 0)
+				{
+					p = strstr(p, "=");
+					if(p != NULL)
+					{
+						sscanf(p+1, "%d", &c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtp);
+					}
+
+					p = strstr(p, "-");
+					if(p != NULL)
+					{
+						sscanf(p+1, "%d", &c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtcp);
+					}
+					else
+					{
+						c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtcp =
+						c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtp + 1;
+					}
+
+					pTmp += sprintf(pTmp, "Transport: RTP/AVP/TCP;unicast;"
+							"interleaved=%d-%d\r\n\r\n",
+							c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtp,
+							c->pstRtspSess->interleaved[RTP_STREAM_VIDEO].rtcp);
+							c->pstRtspSess->setupFlag[0] = 1;
+				}
+			}
+			else if(trackId == TRACK_ID_AUDIO)
+			{
+				if(c->pstRtspSess->setupFlag[1] == 0)
+				{
+					p = strstr(p, "=");
+					if(p != NULL)
+					{
+						sscanf(p+1, "%d", &c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtp);
+					}
+
+					p = strstr(p, "-");
+					if(p != NULL)
+					{
+						sscanf(p+1, "%d", &c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtcp);
+					}
+					else
+					{
+						c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtcp =
+						c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtp + 1;
+					}
+
+					pTmp += sprintf(pTmp, "Transport: RTP/AVP/TCP;unicast;"
+						"interleaved=%d-%d\r\n\r\n",
+						c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtp,
+						c->pstRtspSess->interleaved[RTP_STREAM_AUDIO].rtcp);
+						c->pstRtspSess->setupFlag[1] = 1;
+				}
+			}
+			else if(trackId == TRACK_ID_METADATA)
+			{  //metadata
+				if( c->pstRtspSess->setupFlag[2] == 0 )
+				{
+					p = strstr(p, "=");
+					if(p != NULL)
+					{
+						sscanf(p+1, "%d", &c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtp);
+					}
+
+					p = strstr(p, "-");
+					if(p != NULL)
+					{
+						sscanf(p+1, "%d", &c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtcp);
+					}
+					else
+					{
+						c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtcp =
+						c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtp + 1;
+					}
+
+					pTmp += sprintf(pTmp, "Transport: RTP/AVP/TCP;unicast;"
+						"interleaved=%d-%d\r\n\r\n",
+						c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtp,
+						c->pstRtspSess->interleaved[RTP_STREAM_METADATA].rtcp);
+						c->pstRtspSess->setupFlag[1] = 1;
+				}
+			}
+			else
+			{
+				if(c->pstRtspSess->clientType != enClientTypeEcsion)
+				{
+					LOG_FUNC(Err, False, "setup chn = %d, unsupported transport\n", chn);
+					RTSP_SendReply(461, 1, "Unsupported Transport", c);
+					return 461;
+				}
+			}
+		}
+	}
+	else
+	{
+		p = strstr(line, "RTP/AVP");
+		if(p != NULL)
+		{
+			LOG_FUNC(Err, False, "setup chn = %d, unsupported transport\n",chn);
+			RTSP_SendReply(461, 1, "Unsupported Transport", c);
+			return 461;
+		}
+		else
+		{
+			LOG_FUNC(Err, False, "setup request malformed \n");
+			RTSP_SendReply(400, 1, "Transport have not RTP/AVP or RTP/AVP/TCP", c);
+			return 400;
+		}
+	}
+
+	c->wcurr = c->wbuf;
+    c->wbytes = strlen(c->wbuf);
+
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    WBUFFER_AddMsghdr(c);
+
+    RTSP_CLEAR_RECVBUF(c);
+    CONN_SetState(c, enConnWrite);	
+	c->pstRtspSess->sessStat = RTSP_STATE_READY;
+	
+	return SUCCESS;
+}
+
+sint32 RTSP_EventHandlePlay(ST_CONN_INFO *c)
+{
+	sint8 *pTmp = NULL;
+
+	RTSP_GetRange(c->rbuf, c->pstRtspSess->range);
+	
+	RTSP_CLEAR_SENDBUF(c);
+	pTmp = c->wbuf;
+	pTmp += RTSP_GetHead(200, c);
+
+	if(RTP_TRANSPORT_TYPE_TCP == c->pstRtspSess->transportType)
+	{
+		pTmp += sprintf(pTmp, "Session: %s;timeout=120\r\n\r\n", c->pstRtspSess->sessId);
+	}
+
+	c->wcurr = c->wbuf;
+    c->wbytes = strlen(c->wbuf);
+
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    WBUFFER_AddMsghdr(c);
+
+    RTSP_CLEAR_RECVBUF(c);
+    CONN_SetState(c, enConnWrite);	
+
+	RTSP_CreateSender(c);
+	RTSP_AddSendStreamTsk(c);
+	return SUCCESS;
+}
+
+sint32 RTSP_EventHandleTeamdown(ST_CONN_INFO *c)
+{
+	sint8 *pTmp = NULL;
+	
+	CONN_CheckStreamStop((ST_CONN_INFO *)c->pstRtspSess->pstDevSession);
+	RTSP_FreeSender(c);
+		
+	RTSP_CLEAR_SENDBUF(c);
+	pTmp = c->wbuf;
+
+	pTmp += RTSP_GetHead( RTSP_STATUS_OK, c);
+	pTmp += sprintf(pTmp,"Session: %s\r\n", c->pstRtspSess->sessId);
+	pTmp += sprintf(pTmp,"Connection: Close\r\n\r\n");
+
+    //usleep(200000);
+
+	c->wcurr = c->wbuf;
+	c->wbytes = strlen(c->wbuf);
+	
+	c->msgcurr = 0;
+	c->msgused = 0;
+	c->iovused = 0;
+	WBUFFER_AddMsghdr(c);
+	
+	RTSP_CLEAR_RECVBUF(c);
+	CONN_SetState(c, enConnWrite);	
+	c->pstRtspSess->sessStat = RTSP_STATE_STOP;
+	
+	return SUCCESS;
 }
 
 sint32 RTSP_EventHandle(int event, int stat, ST_CONN_INFO *c)
 {
     sint32 ret;
-    printf("rtsp recv:  %s \n", c->rbuf);
+    //printf("rtsp recv:  %s \n", c->rbuf);
 
     switch(event)
     {
         case RTSP_REQ_METHOD_OPTIONS:
             ret = RTSP_EventHandleOptions(c);
             break;
-
         case RTSP_REQ_METHOD_DESCRIBE:
             ret = RTSP_EventHandleDescribe(c);
             break;
-
-        case RTSP_REQ_METHOD_TEARDOWN:
-            //ret = RTSP_EventHandleTeamdown(pSess);
-            break;
-
         case RTSP_REQ_METHOD_SETUP:
-            //ret = RTSP_EventHandleSetup(pSess);
+            ret = RTSP_EventHandleSetup(c);
             break;
-
         case RTSP_REQ_METHOD_PLAY:
-            //memset(pSess->range,0,sizeof(pSess->range));
-            //ret = RTSP_GetRange(pSess->recvBuf,pSess->range);
-            //ret = RTSP_EventHandlePlay(pSess);
+            ret = RTSP_EventHandlePlay(c);
             break;
-
+		case RTSP_REQ_METHOD_TEARDOWN:
+            ret = RTSP_EventHandleTeamdown(c);
+            break;
         case RTSP_REQ_METHOD_PAUSE:
             //ret = RTSP_EventHandlePause(pSess);
             break;
-
         case RTSP_REQ_METHOD_SET_PARAM:
             //ret = RTSP_EventHandleSetParam(pSess);
             break;
-
         default:
             //ret = RTSP_EventHandleUnknown(pSess);
             break;
@@ -611,26 +1481,28 @@ sint32 RTSP_EventHandle(int event, int stat, ST_CONN_INFO *c)
 sint32 RTSP_SessionProcess(ST_CONN_INFO *c)
 {
     assert(c != NULL);
-    assert(c->pRtspSess != NULL);
+    assert(c->pstRtspSess != NULL);
 
     sint32 stat, seqNum = 0;
     sint32 opcode;
     sint32 cseq = -1;
 
+	LOG_FUNC(Info, False, "rtsp message = %s\n", c->rbuf);
+	
     if(SUCCESS != RTSP_RecvMsgParse(c->rbuf))
     {
         RTSP_CLEAR_RECVBUF(c);
-        return SUCCESS;
+        return FAIL;
     }
 
     if(RTSP_PARSE_IS_RESP == RTSP_ResponseMsgCheck(&stat, c->rbuf))
     {
-        if(seqNum != c->pRtspSess->u32LastSendSeq + 1)
+        if(seqNum != c->pstRtspSess->u32LastSendSeq + 1)
         {
             LOG_FUNC(Warn, False, "last send sn is %d != resp seq = %d\n",
-                     c->pRtspSess->u32LastSendSeq, seqNum);
+                     c->pstRtspSess->u32LastSendSeq, seqNum);
         }
-        opcode = RTSP_MAKE_RESP_CMD(c->pRtspSess->s32LastSendReq);
+        opcode = RTSP_MAKE_RESP_CMD(c->pstRtspSess->s32LastSendReq);
         if(stat > RTSP_BAD_STATUS_BEGIN)
         {
             LOG_FUNC(Warn, False, "response had status = %d. \n", stat);
@@ -656,7 +1528,7 @@ sint32 RTSP_SessionProcess(ST_CONN_INFO *c)
         cseq = RTSP_GetCseq(c->rbuf);
         if(cseq > 0)
         {
-            c->pRtspSess->u32LastRecvSeq = cseq;
+            c->pstRtspSess->u32LastRecvSeq = cseq;
         }
         else
         {
@@ -667,5 +1539,3 @@ sint32 RTSP_SessionProcess(ST_CONN_INFO *c)
 
     return RTSP_EventHandle(opcode, stat, c);
 }
-
-

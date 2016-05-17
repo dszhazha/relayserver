@@ -27,13 +27,28 @@
 #define RTSP_STATUS_BAD_REQUEST         400
 #define RTSP_STATUS_METHOD_NOT_ALLOWED  405
 
+#define NAL_TYPE_SLICE      1
+#define NAL_TYPE_IDR        5
+#define NAL_TYPE_SEI        6
+#define NAL_TYPE_SPS        7
+#define NAL_TYPE_PPS        8
+#define NAL_TYPE_SEQ_END    9
+#define NAL_TYPE_STREAM_END 10
+
+#define 	MAX_VOD_CHN					5	
+#define 	MAX_CLIENTS					4	/* RTSP允许的最大连接用户数 */
+
+#define H264_STARTCODE_LEN      4 /* 00 00 00 01 */
+#define	NAL_FRAGMENTATION_SIZE		1442	/*H264码流的分包单位长度为1024*/
+
+
 #define RTSP_VERSION  			"RTSP/1.0"
 #define RTSP_LRLF 				"\r\n"
 
 #define SRV_NAME         		"ECSINO_RELAY_SRV"    
 #define SRV_VER                  "ECSINO_V1.0"    
 
-#define MULTICAST_IP            "239.0.0.0"
+#define MULTICAST_IP            "0.0.0.0"
 #define MULTICAST_PORT	        34767
 #define MULTICAST_TTL	        1
 
@@ -76,6 +91,10 @@
 
 #define RTSP_MAKE_RESP_CMD(req)		(req+100)
 
+#define 	AUDIO_TYPE				97
+#define   	AUDIO_AAC_TYPE			108
+
+
 typedef enum RtspReqMethod{
 	RTSP_REQ_METHOD_SETUP = 0,
 	RTSP_REQ_METHOD_DESCRIBE,
@@ -102,4 +121,12 @@ enum ClientType
 	enClientTypeUndefined = 0,
 	enClientTypeEcsion 
 }ST_CLITE_TYPE;
+
+typedef enum TrackId
+{
+	TRACK_ID_VIDEO = 0,
+	TRACK_ID_AUDIO,
+	TRACK_ID_METADATA,
+	TRACK_ID_UNKNOWN
+}EN_TRACK_ID;
 

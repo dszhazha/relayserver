@@ -80,5 +80,6 @@ enum
 
 /*name length*/
 #define NAME_LEN		128
+#define MAX_BASE64_LEN  128
 
 
