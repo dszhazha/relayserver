@@ -1,0 +1,73 @@
+OPTIONS rtsp://192.168.1.39/+user=ds RTSP/1.0
+CSeq: 2
+User-Agent: LibVLC/2.2.1 (LIVE555 Streaming Media v2014.07.25)
+
+RTSP/1.0 200 OK
+CSeq: 2
+Server: ECSINO_IPC Rtsp Server ECSINOV1.0
+Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, SET_PARAMETER
+
+DESCRIBE rtsp://192.168.1.39/+user=ds RTSP/1.0
+CSeq: 3
+User-Agent: LibVLC/2.2.1 (LIVE555 Streaming Media v2014.07.25)
+Accept: application/sdp
+
+RTSP/1.0 200 OK
+Cseq: 3 
+Server: GrandStream Rtsp Server V200R001 1280*720*30*2048
+Content-Type: application/sdp
+Content-length: 453
+Content-Base: rtsp://192.168.1.39/0/
+
+v=0
+o=StreamingServer 3331435948 1116907222000 IN IP4 192.168.1.39
+s=h264.mp4
+c=IN IP4 0.0.0.0
+t=0 0
+a=control:*
+m=video 0 RTP/AVP 96
+a=control:trackID=0
+a=rtpmap:96 H264/90000
+a=fmtp:96 packetization-mode=1; sprop-parameter-sets=Z00AH9oBQBbsBagQEBIAAAMA8AAAOEDAgADR9gAHYaXvfCQ=,aO48gA==
+m=audio 0 RTP/AVP 0
+a=control:trackID=1
+a=rtpmap:0 PCMU/8000
+m=application 0 RTP/AVP 107
+a=control:trackID=2
+a=rtpmap:107 vnd.onvif.metadata/90000
+
+SETUP rtsp://192.168.1.39/0/trackID=0 RTSP/1.0
+CSeq: 4
+User-Agent: LibVLC/2.2.1 (LIVE555 Streaming Media v2014.07.25)
+Transport: RTP/AVP/TCP;unicast;interleaved=0-1
+
+RTSP/1.0 200 OK
+CSeq: 4
+Server: ECSINO_IPC Rtsp Server ECSINOV1.0
+Session: 41075967;timeout=120
+Transport: RTP/AVP/TCP;unicast;interleaved=0-1
+
+SETUP rtsp://192.168.1.39/0/trackID=1 RTSP/1.0
+CSeq: 5
+User-Agent: LibVLC/2.2.1 (LIVE555 Streaming Media v2014.07.25)
+Transport: RTP/AVP/TCP;unicast;interleaved=2-3
+Session: 41075967
+
+RTSP/1.0 200 OK
+CSeq: 5
+Server: ECSINO_IPC Rtsp Server ECSINOV1.0
+Session: 41075967;timeout=120
+Transport: RTP/AVP/TCP;unicast;interleaved=2-3
+
+PLAY rtsp://192.168.1.39/0/ RTSP/1.0
+CSeq: 6
+User-Agent: LibVLC/2.2.1 (LIVE555 Streaming Media v2014.07.25)
+Session: 41075967
+Range: npt=0.000-
+
+RTSP/1.0 200 OK
+CSeq: 6
+Server: ECSINO_IPC Rtsp Server ECSINOV1.0
+Session: 41075967;timeout=120
+
+
