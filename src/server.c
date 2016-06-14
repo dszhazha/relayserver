@@ -359,6 +359,14 @@ ST_CONN_INFO *CONN_NodeNew(const sint32 sfd, EN_CONN_STAT init_state,
             LOG_FUNC(Err, True, "Failed to allocate device session\n");
             return NULL;
         }
+
+		c->pstRingBuf = (ST_RING_BUF *)calloc(1, sizeof(ST_RING_BUF));
+		if (c->pstRingBuf == NULL) 
+		{
+            LOG_FUNC(Err, True, "Failed to allocate ringbuf struct\n");
+            exit(-1);
+        }
+		RingBuffer_Init(c->pstRingBuf);
 	}		
 	else if(enConnType == enConnPlayer)
 	{
@@ -1297,11 +1305,11 @@ static sint32 EVENT_ProcessStreamStop(ST_CONN_INFO *c,  sint8 *attr, uint16 u16A
 static sint32 EVENT_ProcessStreamData(ST_CONN_INFO *c,  sint8 *attr, uint16 u16AttrLen, uint16 u32Serial)
 {
 	assert(c != NULL);
-	if(c->pstDevInfo->enDevStat != enDevTransfStream)
+	/*if(c->pstDevInfo->enDevStat != enDevTransfStream)
 	{
 		LOG_FUNC(Info, False, "start stream First\n");
 		return SUCCESS;
-	}
+	}*/
 
 	sint32 	s32Ret = 0;
 	sint8 	*dataBuf = NULL;
@@ -1438,7 +1446,7 @@ static sint32 EVENT_TryReadDevCommand(ST_CONN_INFO *c)
 				return s32Ret;
 			}
 		}
-		else
+		else	
 		{
 			c->u16Sync <<= 8;
 			c->u16Sync |= (uint8)(*c->rpos);

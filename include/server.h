@@ -45,8 +45,8 @@
 
 
 /*protocal head and tail byte defined*/
-#define PROTOCAL_HEAD_BYTE	0xFAF5
-#define PROTOCAL_TAIL_BYTE	0xFAF6
+#define PROTOCAL_HEAD_BYTE	0xFAF5F6
+#define PROTOCAL_TAIL_BYTE	0xFAF6F5
 
 /*ringbuffer index*/
 #define 	MAX_INDEX			65000
