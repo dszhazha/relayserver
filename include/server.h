@@ -49,39 +49,11 @@
 #define PROTOCAL_TAIL_BYTE	0xFAF6F5
 
 /*ringbuffer index*/
-#define 	MAX_INDEX			65000
+#define MAX_INDEX			65000
 
-#define COMMAND_START	0x21
-
-#define PROTOCAL_HEAD_LEN	8
-
-#define HEAD_BYTE1	0xfa
-#define HEAD_BYTE2	0xf5
-
-#define TAIL_BYTE1	0xfa
-#define TAIL_BYTE2	0xf6
-
-#define CMD_SET_HEAD1(pHDR, val)  	((pHDR)->u8Head1 = val)
-#define CMD_SET_HEAD2(pHDR, val)  	((pHDR)->u8Head2 = val)
-#define CMD_SET_TYPE(pHDR, val)  	((pHDR)->u8CmdType = val)
-#define CMD_SET_SERIL(pHDR, val)  	((pHDR)->u16SerilNum = val)
-#define CMD_SET_RQ(pHDR, val)  		((pHDR)->u8CmdRQ = val)
-#define CMD_SET_LEN(pHDR, val)  	((pHDR)->u16CmdLen = val)
-#define CMD_SET_TAIL(BYTE, val)  	(BYTE = val)
-
-typedef enum errorCode
-{
-	enErrLessAttr = 0x01,
-	enErrLoginFirst,
-	enErrStartStreamFirst,
-	enErrNameNotmatch,
-}EN_ERR_CODE;
-
-typedef struct errorCodeMap{
-	EN_ERR_CODE s32ErrCode;
-	sint8   *pDescribe;
-}ST_ERRCODE_MAP;
-
+#define MAX_TOKENS 12
+#define COMMAND_TOKEN 0
+#define SUBCOMMAND_TOKEN 1
 
 /**
  * Possible states of a connection.
@@ -110,7 +82,6 @@ typedef enum try_read_result
     READ_MEMORY_ERROR      /** failed to allocate more memory */
 }EN_TRYREAD_RET;
 
-
 typedef struct libeventThread
 {
     pthread_t threadId;        /* unique ID of this thread */
@@ -121,6 +92,12 @@ typedef struct libeventThread
     struct conn_queue *new_conn_queue; /* queue of new connections to handle */
   
 } ST_LIBEVENT_THREAD;
+
+typedef struct token_s 
+{
+    sint8 *value;
+    uint32 length;
+} ST_TAKEN;
 
 /*command type*/
 typedef enum commandType
@@ -158,18 +135,6 @@ typedef enum commandRQ
 	enCmdTypeReq,		/*request*/
 	enCmdTypeRes		/*responce*/
 }EN_CMD_RQ;
-
-#pragma pack(1)
-typedef struct commandHeader
-{
-	uint8	u8Head1;
-	uint8 	u8Head2;
-	uint8	u8CmdType;   /*command type */
-	uint16	u16SerilNum;	/*serial number 0_65536*/
-	uint8	u8CmdRQ;		/*request or responce*/
-	uint16  u16CmdLen;		/*command length*/
-}ST_CMD_HDR;
-#pragma pack()
 
 typedef enum connectType
 {
@@ -220,7 +185,7 @@ typedef struct deviceInformation
 	sint8 			devName[NAME_LEN];
 	sint8 			devPasswd[NAME_LEN];
 	EN_VENC_TYPE 	enVencType;
-	//EN_VIDEO_RESO	enVreso;
+	EN_VIDEO_RESO	enVresolution;
 	uint32			u32VideoWidth;
 	uint32			u32VideoHeigth;
 	uint32			u32VideoBit;
@@ -368,12 +333,6 @@ typedef struct connectInformation
 	EN_CONN_STAT	enConnStat;
 	 /** which state to go into after finishing current write */
     EN_CONN_STAT  write_and_go;
-
-	bool	bFindEot;
-	uint16	u16Sync;
-	sint8   *rpos;
-	sint8   *rsot;		/*cmd head byte*/
-	sint8   *reot;		/*cmd end byte*/
 
 	/*read buffer struct*/
 	sint8   *rbuf;   /** buffer to read commands into */
