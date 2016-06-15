@@ -1061,6 +1061,27 @@ static void EVENT_ProcessStreamStop(ST_CONN_INFO *c, ST_TAKEN *tokens, const siz
 
 static void EVENT_ProcessStreamData(ST_CONN_INFO *c, ST_TAKEN *tokens, const size_t ntokens)
 {
+	sint32 s32Ret = 0;
+	
+	assert(c != NULL);
+	if(c->pstDevInfo->enDevStat < enDevHeartBeat)
+	{
+		LOG_FUNC(Info, False, "Status error\n");
+		CONN_SetState(c, enConnClosing);
+		return;
+	}
+	
+	if(c->pstRingBuf == NULL)
+	{
+		LOG_FUNC(Info, False, "ringbuf not malloc space, ignore data\n");
+		return;
+	}
+	
+	c->stream_type = = atoi(tokens[1].value);
+	c->stream_pts = atoi(tokens[2].value);
+	c->stream_len = atoi(tokens[2].value);
+
+	CONN_SetState(c, enConnNread);
 	
 }
 
@@ -1419,6 +1440,43 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 		                break;
             	}
            		break; 
+			case enConnNread:
+				if(c->pstRingBuf == NULL)
+				{
+					LOG_FUNC(Err, False, "ringbuf is not malloc\n");
+					CONN_SetState(c, enConnClosing);
+					break;
+				}
+
+				if(c->stream_len < 0)
+				{
+					LOG_FUNC(Err, False, "stream length error\n");
+					CONN_SetState(c, enConnClosing);
+					break;
+				}
+
+				sint8 *ptr = RingBuffer_FillbufPtr(c->pstRingBuf, c->stream_len);
+				sint32 index = RingBuffer_FillbufIndex(c->pstRingBuf);
+				uint32 leftlen = c->stream_len;
+				RingBuffer_WriteLock(c->pstRingBuf, index);
+				/* first check if we have leftovers in the conn_read buffer */
+	            if (c->rbytes > 0)
+				{
+	                int tocopy = c->rbytes > leftlen ? leftlen : c->rbytes;
+	                memmove(ptr, c->rcurr, tocopy);
+	                ptr += tocopy;
+	                leftlen -= tocopy;
+	                c->rcurr += tocopy;
+	                c->rbytes -= tocopy;
+	                if (leftlen == 0) 
+					{
+						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len);
+	                    break;
+	                }
+	            }	
+
+				
+				break;
 			case enConnParseCmd:
 				if(c->enConnType == enConnPlayer)
 				{

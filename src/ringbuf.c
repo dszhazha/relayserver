@@ -159,6 +159,144 @@ void RingBuffer_Write(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTi
 	}
 }
 
+sint8* RingBuffer_FillbufPtr(ST_RING_BUF *ab, uint32 u32Len)
+{
+	if(ab->bIsFull == True)
+	{
+		if(ab->u32CurPos + u32Len <= ab->u32MaxLen)
+		{
+			/*fill oldest buffer*/
+			uint32 	u32OldestIndex;
+			while(ab->u32LeftLen < u32Len)
+			{
+				u32OldestIndex = ab->u32OldIndex;
+				ab->stIndex[u32OldestIndex].bIsLock = True;
+				ab->u32OldIndex++;
+				ab->u32OldIndex %= MAX_INDEX;
+				
+				if(ab->u32HeadIndex == ab->u32OldIndex) //this frame is last frame
+					ab->u32LeftLen += (ab->u32MaxLen - ab->stIndex[u32OldestIndex].offset);
+				else
+					ab->u32LeftLen += ab->stIndex[u32OldestIndex].len;
+				ab->stIndex[u32OldestIndex].offset 	= 0;
+				ab->stIndex[u32OldestIndex].len 	= 0;
+				ab->stIndex[u32OldestIndex].wTime 	= 0;
+				ab->stIndex[u32OldestIndex].frameType = 0;
+				ab->stIndex[u32OldestIndex].pts 	= 0;
+				ab->stIndex[u32OldestIndex].bIsLock = False;
+			}
+			return ab->strBuf + ab->u32CurPos;
+		}
+		else
+		{
+			/*refill buffer*/
+			ab->u32OldIndex = ab->u32HeadIndex;
+			ab->u32HeadIndex = ab->u32CurIndex;
+			ab->u32LeftLen = 0;
+			ab->u32CurPos = 0;
+			
+			/*fill oldest buffer*/
+			uint32 	u32OldestIndex;
+			while(ab->u32LeftLen < u32Len)
+			{
+				u32OldestIndex = ab->u32OldIndex;
+				ab->stIndex[u32OldestIndex].bIsLock = True;
+				ab->u32OldIndex++;
+				ab->u32OldIndex %= MAX_INDEX;
+				
+				if(ab->u32HeadIndex == ab->u32OldIndex) //this frame is last frame
+					ab->u32LeftLen += (ab->u32MaxLen - ab->stIndex[u32OldestIndex].offset);
+				else
+					ab->u32LeftLen += ab->stIndex[u32OldestIndex].len;
+				ab->stIndex[u32OldestIndex].offset 	= 0;
+				ab->stIndex[u32OldestIndex].len 	= 0;
+				ab->stIndex[u32OldestIndex].wTime 	= 0;
+				ab->stIndex[u32OldestIndex].frameType = 0;
+				ab->stIndex[u32OldestIndex].pts 	= 0;
+				ab->stIndex[u32OldestIndex].bIsLock = False;
+			}
+			return ab->strBuf + ab->u32CurPos;
+		}
+	}
+	else
+	{
+		if(ab->u32CurPos + u32Len <= ab->u32MaxLen)
+		{
+			return ab->strBuf + ab->u32CurPos;
+		}
+		else
+		{
+			/*refill buffer*/
+			ab->u32OldIndex = ab->u32HeadIndex;
+			ab->u32HeadIndex = ab->u32CurIndex;
+			ab->u32LeftLen = 0;
+			ab->u32CurPos = 0;
+			
+			/*fill oldest buffer*/
+			uint32 	u32OldestIndex;
+			while(ab->u32LeftLen < u32Len)
+			{
+				u32OldestIndex = ab->u32OldIndex;
+				ab->stIndex[u32OldestIndex].bIsLock = True;
+				ab->u32OldIndex++;
+				ab->u32OldIndex %= MAX_INDEX;
+				
+				if(ab->u32HeadIndex == ab->u32OldIndex) //this frame is last frame
+					ab->u32LeftLen += (ab->u32MaxLen - ab->stIndex[u32OldestIndex].offset);
+				else
+					ab->u32LeftLen += ab->stIndex[u32OldestIndex].len;
+				ab->stIndex[u32OldestIndex].offset 	= 0;
+				ab->stIndex[u32OldestIndex].len 	= 0;
+				ab->stIndex[u32OldestIndex].wTime 	= 0;
+				ab->stIndex[u32OldestIndex].frameType = 0;
+				ab->stIndex[u32OldestIndex].pts 	= 0;
+				ab->stIndex[u32OldestIndex].bIsLock = False;
+			}
+			ab->bIsFull = True;
+			return ab->strBuf + ab->u32CurPos;
+		}
+	}
+
+}
+
+sint32 RingBuffer_FillbufIndex(ST_RING_BUF *ab)
+{
+	return ab->u32CurIndex;
+}
+
+void RingBuffer_WriteLock(ST_RING_BUF *ab, uint32 index)
+{
+	ab->stIndex[index].bIsLock = True;
+}
+
+void RingBuffer_WriteUnlock(ST_RING_BUF *ab, uint32 index)
+{
+	ab->stIndex[index].bIsLock = False;
+}
+
+void RingBuffer_WriteRecord(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTime, sint32 streamType, uint32 pts)
+{
+	uint32 	u32CurPos;
+	uint32	u32CurIndex;
+
+	u32CurIndex = ab->u32CurIndex;
+	u32CurPos = ab->u32CurPos;
+
+	//ab->stIndex[u32CurIndex].bIsLock = True;
+	//memcpy(ab->strBuf + u32CurPos, strData, u32Len);
+	ab->stIndex[u32CurIndex].len 		= u32Len;
+	ab->stIndex[u32CurIndex].offset 	=  u32CurPos;
+	ab->stIndex[u32CurIndex].wTime 		=  wTime;
+	ab->stIndex[u32CurIndex].frameType  = streamType;
+	ab->stIndex[u32CurIndex].pts  		= pts;
+	ab->u32LeftLen -= u32Len;
+	ab->u32CurPos += u32Len;
+	ab->u32CurIndex ++;
+	ab->u32CurIndex %= MAX_INDEX;
+	ab->u32NewIndex = u32CurIndex;
+	//ab->stIndex[u32CurIndex].bIsLock = False;
+}
+
 sint32 RINGBUF_GetNewIndex(ST_RING_BUF *ab)
 {
 	sint32 index ; 

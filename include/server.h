@@ -66,7 +66,7 @@ typedef enum connectionStates
     enConnRead,       	/**< reading in a command line */
     enConnParseCmd,  	/**< try to parse a command from the input buffer */
     enConnWrite,      	/**< writing out a simple response */
-    //conn_nread,      	/**< reading in a fixed number of bytes */
+    enConnNread,      	/**< reading in a fixed number of bytes */
     //conn_swallow,    	/**< swallowing unnecessary bytes w/o storing */
     enConnClosing,    	/**< closing this connection */
     //conn_mwrite,     	/**< writing out many items sequentially */
@@ -232,6 +232,7 @@ typedef struct RingBuffer
 	pthread_mutex_t		muxLock;
 	pthread_cond_t		condRW;
 	ST_FRAME_INDEX	stIndex[MAX_INDEX];	/* Ë÷Òý */	
+	ST_STREAM_INFO	stStreamInfo;
 }ST_RING_BUF;
 
 typedef enum RtpStreamType
@@ -361,6 +362,11 @@ typedef struct connectInformation
     socklen_t requestAddrSize;
 
 	sint16 	  cmd; /* current command being processed */
+
+	/*stream intformation*/
+	uint32	stream_type;
+	uint32	stream_pts;
+	uint32	stream_len;
 
 	ST_RING_BUF 	*pstRingBuf; 
 	ST_DEV_INFO 	*pstDevInfo;
