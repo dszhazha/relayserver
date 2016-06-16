@@ -80,6 +80,13 @@ extern void RingBuffer_Init(ST_RING_BUF *ab);
 extern void RingBuffer_Write(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTime, sint32 streamType, uint32 pts);
 extern sint32 RTSP_SessionProcess(ST_CONN_INFO *c);
 extern sint32 RTSP_SessionCreate(ST_CONN_INFO *c);
+extern sint8* RingBuffer_FillbufPtr(ST_RING_BUF *ab, uint32 u32Len);
+extern sint32 RingBuffer_FillbufIndex(ST_RING_BUF *ab);
+extern void RingBuffer_WriteLock(ST_RING_BUF *ab, uint32 index);
+extern void RingBuffer_WriteUnlock(ST_RING_BUF *ab, uint32 index);
+extern void RingBuffer_WriteRecord(ST_RING_BUF *ab, uint32 u32Len, time_t wTime, sint32 streamType, uint32 pts);
+
+
 void EVENT_SendReqCommand(ST_CONN_INFO *c, EN_CMD_TYPE enCmdType, uint16 u32Serial);
 
 static void SETTINGS_Init(void)
@@ -1061,8 +1068,6 @@ static void EVENT_ProcessStreamStop(ST_CONN_INFO *c, ST_TAKEN *tokens, const siz
 
 static void EVENT_ProcessStreamData(ST_CONN_INFO *c, ST_TAKEN *tokens, const size_t ntokens)
 {
-	sint32 s32Ret = 0;
-	
 	assert(c != NULL);
 	if(c->pstDevInfo->enDevStat < enDevHeartBeat)
 	{
@@ -1077,10 +1082,13 @@ static void EVENT_ProcessStreamData(ST_CONN_INFO *c, ST_TAKEN *tokens, const siz
 		return;
 	}
 	
-	c->stream_type = = atoi(tokens[1].value);
+	c->stream_type = atoi(tokens[1].value);
 	c->stream_pts = atoi(tokens[2].value);
 	c->stream_len = atoi(tokens[2].value);
-
+	c->stream_leftlen = c->stream_len;
+	c->rbindex = RingBuffer_FillbufIndex(c->pstRingBuf);
+	c->rbptr = RingBuffer_FillbufPtr(c->pstRingBuf, c->stream_len);
+	
 	CONN_SetState(c, enConnNread);
 	
 }
@@ -1455,27 +1463,63 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 					break;
 				}
 
-				sint8 *ptr = RingBuffer_FillbufPtr(c->pstRingBuf, c->stream_len);
-				sint32 index = RingBuffer_FillbufIndex(c->pstRingBuf);
-				uint32 leftlen = c->stream_len;
-				RingBuffer_WriteLock(c->pstRingBuf, index);
+				RingBuffer_WriteLock(c->pstRingBuf, c->rbindex);
 				/* first check if we have leftovers in the conn_read buffer */
 	            if (c->rbytes > 0)
 				{
-	                int tocopy = c->rbytes > leftlen ? leftlen : c->rbytes;
-	                memmove(ptr, c->rcurr, tocopy);
-	                ptr += tocopy;
-	                leftlen -= tocopy;
+	                int tocopy = c->rbytes > c->stream_leftlen ? c->stream_leftlen : c->rbytes;
+	                memmove(c->rbptr, c->rcurr, tocopy);
+	                c->rbptr += tocopy;
+	                c->stream_leftlen -= tocopy;
 	                c->rcurr += tocopy;
 	                c->rbytes -= tocopy;
-	                if (leftlen == 0) 
+	                if (c->stream_leftlen <= 0) 
 					{
-						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len);
+						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len,
+							time(NULL), c->stream_type, c->stream_pts);
+						RingBuffer_WriteUnlock(c->pstRingBuf, c->rbindex);
 	                    break;
 	                }
 	            }	
 
-				
+				/*  now try reading from the socket */
+				s32Ret = read(c->s32Sockfd, c->rbptr, c->stream_leftlen);
+				if (s32Ret > 0) 
+				{
+	                c->rbptr += s32Ret;
+	                c->stream_leftlen -= s32Ret;
+					if (c->stream_leftlen <= 0) 
+					{
+						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len,
+							time(NULL), c->stream_type, c->stream_pts);
+						RingBuffer_WriteUnlock(c->pstRingBuf, c->rbindex);
+	                    break;
+	                }
+	                break;
+	            }
+	            if (s32Ret == 0) 
+				{ /* end of stream */
+	                CONN_SetState(c, enConnClosing);
+	                break;
+	            }
+	            if (s32Ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) 
+				{
+					if (!EVENT_UpdateEvent(c, EV_READ | EV_PERSIST))
+					{
+		                if (gstSettings.bVerbose > 0)
+		                    LOG_FUNC(Err, True, "Couldn't update event\n");
+		                CONN_SetState(c, enConnClosing);
+		                break;
+	            	}
+	                stop = true;
+	                break;
+	            }
+	            /* otherwise we have a real error, on which we close the connection */
+	            if (gstSettings.bVerbose > 0)
+				{
+	                LOG_FUNC(Err, True, "Failed to nread\n");
+	            }
+	            CONN_SetState(c, enConnClosing);
 				break;
 			case enConnParseCmd:
 				if(c->enConnType == enConnPlayer)

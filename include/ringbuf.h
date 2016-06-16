@@ -11,3 +11,8 @@
  *      
  */
 
+sint32 RingBuffer_FillbufIndex(ST_RING_BUF *ab);
+void RingBuffer_WriteLock(ST_RING_BUF *ab, uint32 index);
+void RingBuffer_WriteUnlock(ST_RING_BUF *ab, uint32 index);
+void RingBuffer_WriteRecord(ST_RING_BUF *ab, uint32 u32Len, time_t wTime, sint32 streamType, uint32 pts);
+

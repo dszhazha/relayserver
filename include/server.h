@@ -232,7 +232,6 @@ typedef struct RingBuffer
 	pthread_mutex_t		muxLock;
 	pthread_cond_t		condRW;
 	ST_FRAME_INDEX	stIndex[MAX_INDEX];	/* Ë÷Òý */	
-	ST_STREAM_INFO	stStreamInfo;
 }ST_RING_BUF;
 
 typedef enum RtpStreamType
@@ -367,6 +366,9 @@ typedef struct connectInformation
 	uint32	stream_type;
 	uint32	stream_pts;
 	uint32	stream_len;
+	uint32	stream_leftlen;
+	uint32	rbindex;   //ringbuf index
+	sint8 	*rbptr;//ringbuf free space ptr
 
 	ST_RING_BUF 	*pstRingBuf; 
 	ST_DEV_INFO 	*pstDevInfo;

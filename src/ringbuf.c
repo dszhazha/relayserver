@@ -274,7 +274,7 @@ void RingBuffer_WriteUnlock(ST_RING_BUF *ab, uint32 index)
 	ab->stIndex[index].bIsLock = False;
 }
 
-void RingBuffer_WriteRecord(ST_RING_BUF *ab, uint32 u32Len, sint8 *strData, time_t wTime, sint32 streamType, uint32 pts)
+void RingBuffer_WriteRecord(ST_RING_BUF *ab, uint32 u32Len, time_t wTime, sint32 streamType, uint32 pts)
 {
 	uint32 	u32CurPos;
 	uint32	u32CurIndex;
