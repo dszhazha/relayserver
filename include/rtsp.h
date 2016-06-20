@@ -130,3 +130,8 @@ typedef enum TrackId
 	TRACK_ID_UNKNOWN
 }EN_TRACK_ID;
 
+typedef enum TcpSyncState{
+	SYNC_WAIT = 2,
+	SYNC_OK
+}TcpSyncStat_e;
+

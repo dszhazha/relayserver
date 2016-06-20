@@ -1084,13 +1084,16 @@ static void EVENT_ProcessStreamData(ST_CONN_INFO *c, ST_TAKEN *tokens, const siz
 	
 	c->stream_type = atoi(tokens[1].value);
 	c->stream_pts = atoi(tokens[2].value);
-	c->stream_len = atoi(tokens[2].value);
+	c->stream_len = atoi(tokens[3].value);
 	c->stream_leftlen = c->stream_len;
 	c->rbindex = RingBuffer_FillbufIndex(c->pstRingBuf);
 	c->rbptr = RingBuffer_FillbufPtr(c->pstRingBuf, c->stream_len);
-	
+	if(c->stream_len > 10000)
+	{
+		printf("recv a I frame len = %d, type = %d, pts = %d\n", c->stream_len, c->stream_type, c->stream_pts);
+	}
 	CONN_SetState(c, enConnNread);
-	
+	return;
 }
 
 /*
@@ -1170,7 +1173,7 @@ static void EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
 	if (c->enConnType == enConnDevice)
 	{
 		ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-		printf("ntokens = %d, cmd = %s\n",ntokens, tokens[COMMAND_TOKEN].value);
+		//printf("ntokens = %d, cmd = %s\n",ntokens, tokens[COMMAND_TOKEN].value);
 		
 		if (ntokens == 3 && strcmp(tokens[COMMAND_TOKEN].value, "LINK") == 0)
 		{
@@ -1191,7 +1194,7 @@ static void EVENT_ProcessCommand(ST_CONN_INFO *c, sint8 *command)
 		else
 		{
 			printf("UNKNOW MESSAGE\n");
-			EVENT_SendMessage(c, "UNKNOW");
+			EVENT_SendMessage(c, "UNKNOW\r\n");
 		}
 	}
 	
@@ -1225,7 +1228,7 @@ static sint32 EVENT_TryReadDevCommand(ST_CONN_INFO *c)
 	*el = '\0';
 	
 	assert(cont <= (c->rcurr + c->rbytes));
-	printf("Msg:%s\n", c->rcurr);
+	//printf("Msg:%s\n", c->rcurr);
 	EVENT_ProcessCommand(c, c->rcurr);
 
 	c->rbytes -= (cont - c->rcurr);
@@ -1449,6 +1452,22 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
             	}
            		break; 
 			case enConnNread:
+				if (c->stream_leftlen <= 0) 
+				{
+					/*simple check data finish*/
+					if(*(c->rbptr-2) == '\r' && *(c->rbptr-1) == '\n')
+					{
+						//printf("recv a frame len = %d\n", c->stream_len);
+						/*remember get ride of \r\n*/
+						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len-2,
+							time((time_t*)NULL), c->stream_type, c->stream_pts);
+					}
+					
+					RingBuffer_WriteUnlock(c->pstRingBuf, c->rbindex);
+					CONN_SetState(c, enConnNewCmd);
+	                break;
+				}
+				
 				if(c->pstRingBuf == NULL)
 				{
 					LOG_FUNC(Err, False, "ringbuf is not malloc\n");
@@ -1473,11 +1492,8 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 	                c->stream_leftlen -= tocopy;
 	                c->rcurr += tocopy;
 	                c->rbytes -= tocopy;
-	                if (c->stream_leftlen <= 0) 
+	                if (c->stream_leftlen == 0) 
 					{
-						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len,
-							time(NULL), c->stream_type, c->stream_pts);
-						RingBuffer_WriteUnlock(c->pstRingBuf, c->rbindex);
 	                    break;
 	                }
 	            }	
@@ -1488,13 +1504,6 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 				{
 	                c->rbptr += s32Ret;
 	                c->stream_leftlen -= s32Ret;
-					if (c->stream_leftlen <= 0) 
-					{
-						RingBuffer_WriteRecord(c->pstRingBuf, c->stream_len,
-							time(NULL), c->stream_type, c->stream_pts);
-						RingBuffer_WriteUnlock(c->pstRingBuf, c->rbindex);
-	                    break;
-	                }
 	                break;
 	            }
 	            if (s32Ret == 0) 
@@ -1519,7 +1528,7 @@ static void EVENT_DriveMachine(ST_CONN_INFO *c)
 				{
 	                LOG_FUNC(Err, True, "Failed to nread\n");
 	            }
-	            CONN_SetState(c, enConnClosing);
+				CONN_SetState(c, enConnClosing);
 				break;
 			case enConnParseCmd:
 				if(c->enConnType == enConnPlayer)

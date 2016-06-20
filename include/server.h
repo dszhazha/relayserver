@@ -279,8 +279,6 @@ typedef struct RtpTcpSender_s{
 	sint32		tcpSockFd;
 	uint8		sendBuf[MAX_RTP_LEN];
 	uint32		sendLen;
-	bool		bFirstSendFlag;
-	uint32		u32SendIndex;
 }ST_RTPTCP_SENDER;
 
 typedef struct rtspSession

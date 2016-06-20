@@ -329,6 +329,16 @@ sint32 RINGBUF_GetCurPacketLen(ST_RING_BUF *ab, uint32 u32index)
 	return len;
 }
 
+sint8 *RINGBUF_GetCurPacketPtr(ST_RING_BUF *ab, uint32 u32index)
+{
+	if(ab->stIndex[u32index].bIsLock == False)
+	{
+		return ab->strBuf + ab->stIndex[u32index].offset;
+	}
+
+	return NULL;
+}
+
 sint32 RINGBUF_GetCurNalType(ST_RING_BUF *ab, uint32 index)
 {
 	sint32 frameType;

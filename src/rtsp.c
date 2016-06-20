@@ -17,6 +17,8 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <pthread.h>
+#include <fcntl.h>
 
 #include "server.h"
 #include "rtsp.h"
@@ -130,7 +132,6 @@ static sint32 RTSP_CreateSender(ST_CONN_INFO *c)
 	c->pstRtspSess->pstRtpSender->metadataSsrc = RTP_DEFAULT_SSRC + 256;
 	c->pstRtspSess->pstRtpSender->audioG711Ssrc = RTP_DEFAULT_SSRC + 128;
 	c->pstRtspSess->pstRtpSender->videoH264Ssrc = RTP_DEFAULT_SSRC;
-	c->pstRtspSess->pstRtpSender->bFirstSendFlag = True;
 	return SUCCESS;
 }
 
@@ -175,110 +176,130 @@ sint32 RTP_FrameTcpSendN(sint32 sockFd, sint8 *buf, sint32 size)
 sint32 RTP_TcpSend(ST_CONN_INFO *c, sint32 type)
 {
 	sint32 	ret = 0;
-
+	
 	if(c->s32Sockfd > 0)
 	{
 		ret = RTP_FrameTcpSendN(c->s32Sockfd, (char *)c->pstRtspSess->pstRtpSender->sendBuf,
-												c->pstRtspSess->pstRtpSender->sendLen +4);
+												c->pstRtspSess->pstRtpSender->sendLen+4);
 		/*sendBuf[0] = '$'
 	          sendBuf[1] = interleaved
 	          sendBuf[2~3] = sendLen
 	          sendBuf[4~] = data  */
-		if(ret == c->pstRtspSess->pstRtpSender->sendLen + 4 )
+		if(ret == c->pstRtspSess->pstRtpSender->sendLen + 4)
 		{
 			return SUCCESS;
 		}
 	}
-	LOG_FUNC(Err, False, "send %d, sendLen = %d , sockfd = %d\n",
+	
+	LOG_FUNC(Err, True, "send %d, sendLen = %d , sockfd = %d\n",
 					ret, c->pstRtspSess->pstRtpSender->sendLen, c->pstRtspSess->pstRtpSender->tcpSockFd);
 	return FAIL;
 }
 
-static sint32 RTSP_SendStream(ST_CONN_INFO *c)
+static void *RTSP_SendStreamFxn(void *arg)
 {
-	assert(c->enConnType == enConnPlayer);
+	ST_CONN_INFO *c = (ST_CONN_INFO *)arg;
 	sint8 	*pstrData = NULL;
 	sint8 	*pSend = NULL;
 	sint8 	*pBuf = NULL; 
 	sint32 	pktLen = 0, syncIndex, type, dataLen, nalType;
 	sint32	leftLen, pos;
 	uint8 	sToken;
-	uint32 	pts;
+	uint32 	pts, syncStat = SYNC_WAIT;;
+	uint32 	index;
 	ST_CONN_INFO *pds = (ST_CONN_INFO *)c->pstRtspSess->pstDevSession;
-	
-	if(pds->pstDevInfo->enDevStat == enDevTransfStream) //transfer stream data
-	{
-		if(c->pstRtspSess->pstRtpSender->bFirstSendFlag == True)
-		{
-			c->pstRtspSess->pstRtpSender->u32SendIndex = 
-				RINGBUF_GetNewIndex(pds->pstRingBuf);
-			pktLen = RINGBUF_GetCurPacketLen(pds->pstRingBuf, 
-					c->pstRtspSess->pstRtpSender->u32SendIndex);
-			if(pktLen <= 0)
-			{
-				usleep(1000);
-				LOG_FUNC(Info, False, "find sps ,index = %d,len=%d\n", 
-					c->pstRtspSess->pstRtpSender->u32SendIndex, pktLen);
-				return SUCCESS;
-			}
-			else if(NAL_TYPE_SPS == RINGBUF_GetCurNalType(pds->pstRingBuf, 
-					c->pstRtspSess->pstRtpSender->u32SendIndex))
-			{
-				c->pstRtspSess->pstRtpSender->bFirstSendFlag = False;
-			}
-			else
-			{
-				RINGBUF_IndexCount(pds->pstRingBuf, 
-					&c->pstRtspSess->pstRtpSender->u32SendIndex);
-				return SUCCESS;
-			}		
-		}
 
-		pktLen = RINGBUF_GetOnePacket(pds->pstRingBuf, 
-			c->pstRtspSess->pstRtpSender->u32SendIndex, &pstrData);
+	assert(c != NULL);
+	assert(c->enConnType == enConnPlayer);
+	assert(pds->enConnType == enConnDevice);
+	sleep(2);
+
+	#if 1
+	printf("Send stream start\n");
+
+	//struct event_base *base = c->evConnEvent.ev_base;
+    if (event_del(&c->evConnEvent) == -1) 
+    {
+		printf("Del event error\n");
+		return NULL;
+	}
+	
+	if (fcntl(c->s32Sockfd, F_SETFL, fcntl(c->s32Sockfd, F_GETFL)&~O_NONBLOCK) < 0) 
+	{
+		LOG_FUNC(Err, True, "setting O_NONBLOCK");
+		return NULL;
+	}
+	#endif
+	while(c->pstRtspSess->sessStat == RTSP_STATE_PLAY)
+	{
+		if(SYNC_WAIT == syncStat)
+		{
+			index = RINGBUF_GetNewIndex(pds->pstRingBuf);
+			while (SYNC_WAIT == syncStat)
+			{
+				if(RTSP_STATE_PLAY != c->pstRtspSess->sessStat)
+				{
+					LOG_FUNC(Err, False, "pSess stat is not play \n");
+					goto __SendStreamFxn;
+				}
+				pktLen = RINGBUF_GetCurPacketLen(pds->pstRingBuf, index);
+				if(pktLen <= 0)
+				{
+					usleep(1000);
+					LOG_FUNC(Info, False, "find sps ,index = %d,len=%d\n", index, pktLen);
+					continue;
+				}
+				else if(NAL_TYPE_SPS == RINGBUF_GetCurNalType(pds->pstRingBuf, index))
+				{
+					LOG_FUNC(Info, False, "have find sps\n");
+					syncStat = SYNC_OK;
+				}
+				else
+				{
+					RINGBUF_IndexCount(pds->pstRingBuf, &index);
+					continue;
+				}		
+			}	
+		}
+		
+		pktLen = RINGBUF_GetOnePacket(pds->pstRingBuf, index, &pstrData);
 		/*send too fast*/
 		while(pktLen <= 0)
 		{
 			if(RTSP_STATE_PLAY != c->pstRtspSess->sessStat)
 			{
 				LOG_FUNC(Err, False, "pSess stat is not play \n");
-				return FAIL;
+				return NULL;
 			}
-			c->pstRtspSess->pstRtpSender->u32SendIndex = 
-				RINGBUF_GetNewIndex(pds->pstRingBuf);
-				
-			pktLen = RINGBUF_GetOnePacket(pds->pstRingBuf, 
-					c->pstRtspSess->pstRtpSender->u32SendIndex, &pstrData);
+			index = RINGBUF_GetNewIndex(pds->pstRingBuf);
+			pktLen = RINGBUF_GetOnePacket(pds->pstRingBuf, index, &pstrData);
 			LOG_FUNC(Err, False, "too fast , len = %d\n", pktLen);
 			usleep(1000);
 		}
 
 		syncIndex = RINGBUF_GetNewIndex(pds->pstRingBuf);
 		/*send too slow*/
-		if(True == RINGBUF_CheckTimeout(pds->pstRingBuf, 
-			c->pstRtspSess->pstRtpSender->u32SendIndex, syncIndex))
+		if(True == RINGBUF_CheckTimeout(pds->pstRingBuf, index, syncIndex))
 		{
-			c->pstRtspSess->pstRtpSender->u32SendIndex = 
-				RINGBUF_GetNewIndex(pds->pstRingBuf);
+			index = RINGBUF_GetNewIndex(pds->pstRingBuf);
 			LOG_FUNC(Err, False, "too slow len = %d\n", pktLen);
-			return FAIL;
+			return NULL;
 		}
-		
+
 		pBuf = (sint8 *)(c->pstRtspSess->pstRtpSender->sendBuf+RTP_HDR_LEN+4);
-		type = RINGBUF_GetCurNalType(pds->pstRingBuf, c->pstRtspSess->pstRtpSender->u32SendIndex);
-		pts = RINGBUF_GetCurPktPts(pds->pstRingBuf, c->pstRtspSess->pstRtpSender->u32SendIndex);
-		
+		type = RINGBUF_GetCurNalType(pds->pstRingBuf, index);
+		pts = RINGBUF_GetCurPktPts(pds->pstRingBuf, index);
 		if((type == AUDIO_TYPE)||(type == AUDIO_AAC_TYPE))
 		{
-			if(c->pstRtspSess->reqStreamFlag[1] == True)
+			if(c->pstRtspSess->reqStreamFlag[1] == True && 0)
 			{
-				printf("send audio data\n");
+				printf("send audio data len=%d\n", pktLen);
 				memcpy(pBuf, pstrData, pktLen);
 				RTP_TcpPacket(c->pstRtspSess->pstRtpSender, type, pts, 1, pktLen, pstrData);
 				if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_AUDIO))
 				{
 					LOG_FUNC(Err, False, "RTP_TcpSend error\n");
-					return FAIL;
+					return NULL;
 				}
 			}
 		}
@@ -298,7 +319,7 @@ static sint32 RTSP_SendStream(ST_CONN_INFO *c)
 					if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_VIDEO))
 					{
 						LOG_FUNC(Err, False, "RTP_TcpSend error\n");
-						return FAIL;
+						return NULL;
 					}
 				}
 				else
@@ -313,7 +334,7 @@ static sint32 RTSP_SendStream(ST_CONN_INFO *c)
 						if(RTSP_STATE_PLAY != c->pstRtspSess->sessStat)
 						{
 							LOG_FUNC(Err, False, "pSess stat is not play \n");
-							return FAIL;
+							return NULL;
 						}
 	
 						pBuf[1] = (sToken << 7) | nalType;
@@ -324,7 +345,7 @@ static sint32 RTSP_SendStream(ST_CONN_INFO *c)
 						if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_VIDEO))
 						{
 							LOG_FUNC(Err, False, "RTP_TcpSend error\n");
-							return FAIL;
+							return NULL;
 						}
 						sToken 	= 0;
 						leftLen -= NAL_FRAGMENTATION_SIZE;
@@ -343,53 +364,32 @@ static sint32 RTSP_SendStream(ST_CONN_INFO *c)
 					if(SUCCESS != RTP_TcpSend(c, RTP_STREAM_VIDEO))
 					{
 						LOG_FUNC(Err, False, "RTP_TcpSend error\n");
-						return FAIL;
+						return NULL;
 					}
 				}
 			}
 		}
-		RINGBUF_IndexCount(pds->pstRingBuf, &c->pstRtspSess->pstRtpSender->u32SendIndex);
+		RINGBUF_IndexCount(pds->pstRingBuf, &index);
 	}
-
-	return SUCCESS;
+__SendStreamFxn:
+	c->pstRtspSess->sessStat = RTSP_STATE_STOP;
+	printf("Send stream fxn stop\n");
+	return NULL;
 }
 
-void RTSP_SendStreamHandler(const sint32 fd, const sint16 which, void *arg) 
+static void RTSP_SendStreamStart(ST_CONN_INFO *c)
 {
-    ST_CONN_INFO *c;
+    int         ret;
+	pthread_t 		thd;
+	pthread_attr_t  attr;
 
-    c = (ST_CONN_INFO *)arg;
-    assert(c != NULL);
-
-    /* sanity */
-    if (fd != c->s32Sockfd)
+    pthread_attr_init(&attr);
+    if ((ret = pthread_create(&thd, &attr, RTSP_SendStreamFxn, c)) != 0)
 	{
-        if (gstSettings.bVerbose)
-            LOG_FUNC(Debug, False, "Catastrophic: event fd doesn't match conn fd!\n");
-        CONN_SocketClose(c);
-        return;
+        LOG_FUNC(Err, True, "Can't create thread\n");
+        exit(1);
     }
-
-    RTSP_SendStream(c);
-	
-    /* wait for next event */
-    return;
-}
-
-sint32 RTSP_AddSendStreamTsk(ST_CONN_INFO *c) 
-{
-    assert(c != NULL);
-
-    struct event_base *base = c->evConnEvent.ev_base;
-    event_del(&c->pstRtspSess->evSendDataEvent);
-    event_set(&c->pstRtspSess->evSendDataEvent, c->s32Sockfd, EV_WRITE | EV_PERSIST,
-		RTSP_SendStreamHandler, (void *)c);
-    event_base_set(base, &c->pstRtspSess->evSendDataEvent);
-    if (event_add(&c->pstRtspSess->evSendDataEvent, 0) == -1) 
-		return FAIL;
-
-	c->pstRtspSess->sessStat = RTSP_STATE_PLAY;
-    return SUCCESS;
+	pthread_detach(thd);
 }
 
 /* clear recv and send buffer*/
@@ -889,6 +889,8 @@ sint32 RTSP_SessionCreate(ST_CONN_INFO *c)
 	return SUCCESS;
 }
 
+
+
 sint32 RTSP_EventHandleOptions(ST_CONN_INFO *c)
 {
     sint32 station;
@@ -925,7 +927,6 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 	sint8 	*p = NULL;
 	sint8 	*pSdp = NULL;
 	
-    //MD5_CTX     md5p;
     ST_MULTICAST_PARA   stMulticastPara;
     memset(&stMulticastPara, 0x0, sizeof(ST_MULTICAST_PARA));
     //memset(&md5p, 0x0, sizeof(MD5_CTX));
@@ -1013,13 +1014,15 @@ sint32 RTSP_EventHandleDescribe(ST_CONN_INFO *c)
 	}
 	ST_CONN_INFO *pds = (ST_CONN_INFO *)c->pstRtspSess->pstDevSession;
 
+#if 0
 	if(SUCCESS != CONN_CheckStreamStart(pds))
 	{
 		LOG_FUNC(Err, False, "CONN_CheckStreamStart error\n");
 		RTSP_SendReply(RTSP_STATUS_BAD_REQUEST, 1, NULL, c);
 		return RTSP_STATUS_BAD_REQUEST;
 	}
-	
+#endif
+
 	RTSP_CLEAR_SENDBUF(c);
 	pTmp = c->wbuf;
 	pTmp += sprintf(pTmp, "%s %d %s\r\n", RTSP_VERSION, 200, RTSP_GetMethodDescrib(200));
@@ -1408,7 +1411,10 @@ sint32 RTSP_EventHandlePlay(ST_CONN_INFO *c)
     CONN_SetState(c, enConnWrite);	
 
 	RTSP_CreateSender(c);
-	RTSP_AddSendStreamTsk(c);
+	c->pstRtspSess->sessStat = RTSP_STATE_PLAY;
+
+	RTSP_SendStreamStart(c);
+	
 	return SUCCESS;
 }
 
@@ -1466,12 +1472,15 @@ sint32 RTSP_EventHandle(int event, int stat, ST_CONN_INFO *c)
             ret = RTSP_EventHandleTeamdown(c);
             break;
         case RTSP_REQ_METHOD_PAUSE:
+			printf("Pause\n");
             //ret = RTSP_EventHandlePause(pSess);
             break;
         case RTSP_REQ_METHOD_SET_PARAM:
+			printf("Set param\n");
             //ret = RTSP_EventHandleSetParam(pSess);
             break;
         default:
+			printf("Unknow\n");
             //ret = RTSP_EventHandleUnknown(pSess);
             break;
     }
